@@ -87,7 +87,7 @@ jobs:
         run: |
           brew uninstall cmake
           brew install bison pkg-config gettext glib-utils libgpg-error nasm make meson cmake
-          brew install llvm spirv-llvm-translator libclc libxcb libxrandr
+          brew install llvm spirv-llvm-translator libclc spirv-tools libxcb libxrandr
           python3 -m pip install --break-system-packages --user six pyparsing pyyaml setuptools distlib mako
           gem install --user-install xcpretty
           rm -f /usr/local/lib/pkgconfig/*.pc
