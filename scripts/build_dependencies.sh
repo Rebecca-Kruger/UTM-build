@@ -222,6 +222,32 @@ download_all () {
     clone $HYPERVISOR_REPO $HYPERVISOR_COMMIT
     clone $LIBUCONTEXT_REPO $LIBUCONTEXT_COMMIT
     clone $MESA_REPO $MESA_COMMIT
+    
+    # Apply Mesa compatibility fixes required by LLVM/Clang 22.
+    MESA_DIR="$BUILD_DIR/mesa.git"
+    MESA_UPSTREAM="https://gitlab.freedesktop.org/mesa/mesa.git"
+    MESA_LLVM22_FIX_UNUSED="7f9a7ed5533e2bbc759d667075cccec024490d04"
+    MESA_LLVM22_FIX_RESOURCES="dc03f94e070900365cc1ad91437db178d4d40573"
+
+    # A retry may reuse the existing Mesa checkout. Restore the pinned
+    # revision before applying the compatibility patches again.
+    git -C "$MESA_DIR" reset --hard "$MESA_COMMIT"
+
+    retry git -C "$MESA_DIR" fetch "$MESA_UPSTREAM" \
+        "$MESA_LLVM22_FIX_UNUSED" \
+        "$MESA_LLVM22_FIX_RESOURCES"
+
+    for FIX_COMMIT in \
+        "$MESA_LLVM22_FIX_UNUSED" \
+        "$MESA_LLVM22_FIX_RESOURCES"
+    do
+        git -C "$MESA_DIR" show \
+            --format= \
+            "$FIX_COMMIT" \
+            -- src/compiler/clc/clc_helpers.cpp |
+            git -C "$MESA_DIR" apply -
+    done
+    
     clone $MOLTENVK_REPO $MOLTENVK_COMMIT
     clone_moltenvk_dependences $MOLTENVK_REPO
     download $LLVM15_SRC
