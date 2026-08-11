@@ -83,12 +83,12 @@ jobs:
         run: |
           echo "/usr/local/opt/bison/bin:/opt/homebrew/opt/bison/bin" >> $GITHUB_PATH
       - name: Install Requirements
-        if: (steps.cache-sysroot.outputs.cache-matched-key == '' || github.event.inputs.rebuild_sysroot == 'true') && needs.configuration.outputs.runner == env.RUNNER_IMAGE
+        if: (steps.cache-sysroot.outputs.cache-matched-key == '' || github.event.inputs.rebuild_sysroot == 'true') 
         run: |
           brew uninstall cmake
           brew install bison pkg-config gettext glib-utils libgpg-error nasm make meson cmake
           brew install llvm spirv-llvm-translator libxcb libxrandr
-          pip3 install --break-system-packages --user six pyparsing pyyaml setuptools distlib mako
+          python3 -m pip3 install --break-system-packages --user six pyparsing pyyaml setuptools distlib mako
           gem install --user-install xcpretty
           rm -f /usr/local/lib/pkgconfig/*.pc
       - name: Build Sysroot
