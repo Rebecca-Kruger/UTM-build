@@ -253,10 +253,11 @@ download_all () {
     download $LLVM15_SRC
     clone $DXMT_REPO $DXMT_COMMIT
     DXMT_DIR="$BUILD_DIR/$(basename $DXMT_REPO)"
-    # iOS Metal cannot render or blend A8Unorm attachments. Reset first so
-    # repeated dependency builds apply the local guard patch idempotently.
+    # Apple-family Metal cannot render A8Unorm attachments. Reset first so
+    # repeated dependency builds apply the R8-backed A8 compatibility patch
+    # idempotently.
     git -C "$DXMT_DIR" reset --hard "$DXMT_COMMIT"
-    git -C "$DXMT_DIR" apply "$PATCHES_DIR/dxmt-a8unorm-render-target-guard.patch"
+    git -C "$DXMT_DIR" apply "$PATCHES_DIR/dxmt-a8unorm-emulation.patch"
     clone $D3DMETAL_REPO $D3DMETAL_COMMIT
 }
 

@@ -13,7 +13,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: build-utm-hv-ios-arm64
+  # Keep builds from different branches independent. Without the ref suffix,
+  # dispatching this compatibility branch would cancel the guard build that
+  # is already running because cancel-in-progress is enabled.
+  group: build-utm-hv-ios-arm64-${{ github.ref }}
   cancel-in-progress: true
 
 env:

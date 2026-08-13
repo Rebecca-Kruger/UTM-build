@@ -1,0 +1,518 @@
+diff --git a/src/airconv/airconv_public.h b/src/airconv/airconv_public.h
+index cc1be7b..184d721 100644
+--- a/src/airconv/airconv_public.h
++++ b/src/airconv/airconv_public.h
+@@ -5,7 +5,7 @@
+ #ifndef __AIRCONV_H
+ #define __AIRCONV_H
+ 
+-#define AIRCONV_VERSION 32
++#define AIRCONV_VERSION 33
+ 
+ #ifdef __cplusplus
+ #include <string>
+@@ -252,6 +252,8 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
+   bool dual_source_blending;
+   bool disable_depth_output;
+   uint32_t unorm_output_reg_mask;
++  /* A8 targets backed by R8: route the shader's alpha output to red. */
++  uint32_t a8_output_reg_mask;
+   /* Float-typed output registers redeclared as uint/int because the
+    * bound RTV has an integer format (undefined in D3D11; real hardware
+    * bit-reinterprets, and Metal rejects the pipeline otherwise). */
+diff --git a/src/airconv/dxbc_converter.cpp b/src/airconv/dxbc_converter.cpp
+index 7c9d49f..759e961 100644
+--- a/src/airconv/dxbc_converter.cpp
++++ b/src/airconv/dxbc_converter.cpp
+@@ -251,6 +251,7 @@ llvm::Error convert_dxbc_pixel_shader(
+   bool pso_dual_source_blending = false;
+   bool pso_disable_depth_output = false;
+   uint32_t pso_unorm_output_reg_mask = 0;
++  uint32_t pso_a8_output_reg_mask = 0;
+   uint32_t pso_uint_output_reg_mask = 0;
+   uint32_t pso_sint_output_reg_mask = 0;
+   SM50_SHADER_PSO_PIXEL_SHADER_DATA *pso_data = nullptr;
+@@ -258,6 +259,7 @@ llvm::Error convert_dxbc_pixel_shader(
+     pso_dual_source_blending = pso_data->dual_source_blending;
+     pso_disable_depth_output = pso_data->disable_depth_output;
+     pso_unorm_output_reg_mask = pso_data->unorm_output_reg_mask;
++    pso_a8_output_reg_mask = pso_data->a8_output_reg_mask;
+     pso_uint_output_reg_mask = pso_data->uint_output_reg_mask;
+     pso_sint_output_reg_mask = pso_data->sint_output_reg_mask;
+     pso_sample_mask = pso_data->sample_mask;
+@@ -290,6 +292,7 @@ llvm::Error convert_dxbc_pixel_shader(
+     sig_ctx.disable_depth_output = pso_disable_depth_output;
+     sig_ctx.pull_mode_reg_mask = shader_info->pull_mode_reg_mask;
+     sig_ctx.unorm_output_reg_mask = pso_unorm_output_reg_mask;
++    sig_ctx.a8_output_reg_mask = pso_a8_output_reg_mask;
+     sig_ctx.uint_output_reg_mask = pso_uint_output_reg_mask;
+     sig_ctx.sint_output_reg_mask = pso_sint_output_reg_mask;
+     for (auto &p : pShaderInternal->signature_handlers) {
+diff --git a/src/airconv/dxbc_converter.hpp b/src/airconv/dxbc_converter.hpp
+index 8a0c133..6a8efc8 100644
+--- a/src/airconv/dxbc_converter.hpp
++++ b/src/airconv/dxbc_converter.hpp
+@@ -274,6 +274,9 @@ pop_output_reg(uint32_t from_reg, uint32_t mask, uint32_t to_element);
+ std::function<IRValue(pvalue)>
+ pop_output_reg_fix_unorm(uint32_t from_reg, uint32_t mask, uint32_t to_element);
+ 
++std::function<IRValue(pvalue)>
++pop_output_reg_a8(uint32_t from_reg, uint32_t mask, uint32_t to_element);
++
+ std::function<IRValue(pvalue)>
+ pop_output_reg_sanitize_pos(uint32_t from_reg, uint32_t mask, uint32_t to_element);
+ 
+@@ -330,6 +333,7 @@ struct SignatureContext {
+   bool skip_vertex_output;
+   uint32_t pull_mode_reg_mask;
+   uint32_t unorm_output_reg_mask;
++  uint32_t a8_output_reg_mask;
+   uint32_t uint_output_reg_mask;
+   uint32_t sint_output_reg_mask;
+ 
+@@ -338,7 +342,7 @@ struct SignatureContext {
+   )
+       : prologue(prologue), epilogue(epilogue), func_signature(func_signature), resource(resource), ia_layout(nullptr),
+         dual_source_blending(false), disable_depth_output(false), skip_vertex_output(false), pull_mode_reg_mask(0),
+-        unorm_output_reg_mask(0), uint_output_reg_mask(0), sint_output_reg_mask(0){};
++        unorm_output_reg_mask(0), a8_output_reg_mask(0), uint_output_reg_mask(0), sint_output_reg_mask(0){};
+ };
+ 
+ struct MeshOutputContext {
+diff --git a/src/airconv/dxbc_converter_basicblock.cpp b/src/airconv/dxbc_converter_basicblock.cpp
+index a289a58..4802af9 100644
+--- a/src/airconv/dxbc_converter_basicblock.cpp
++++ b/src/airconv/dxbc_converter_basicblock.cpp
+@@ -320,6 +320,23 @@ std::function<IRValue(pvalue)> pop_output_reg_fix_unorm(uint32_t from_reg, uint3
+   };
+ }
+ 
++std::function<IRValue(pvalue)>
++pop_output_reg_a8(uint32_t from_reg, uint32_t mask, uint32_t to_element) {
++  return [=](pvalue ret) {
++    return make_irvalue_bind([=](context ctx) -> IRValue {
++      auto const_index = llvm::ConstantInt::get(ctx.llvm, llvm::APInt{32, from_reg, false});
++      auto fvec4 = co_yield load_from_array_at(ctx.resource.output.ptr_float4, const_index);
++      auto corrected =
++          ctx.builder.CreateFSub(fvec4, co_yield get_float4_splat(1.0f / 127500.0f));
++      auto alpha = ctx.builder.CreateExtractElement(corrected, uint64_t(3));
++      llvm::Value *routed = llvm::ConstantAggregateZero::get(corrected->getType());
++      routed = ctx.builder.CreateInsertElement(routed, alpha, uint64_t(0));
++      routed = ctx.builder.CreateInsertElement(routed, alpha, uint64_t(3));
++      co_return ctx.builder.CreateInsertValue(ret, routed, {to_element});
++    });
++  };
++}
++
+ std::function<IRValue(pvalue)> pop_output_reg_sanitize_pos(uint32_t from_reg, uint32_t mask, uint32_t to_element) {
+   return [=](pvalue ret) {
+     return make_irvalue_bind([=](context ctx) -> IRValue {
+diff --git a/src/airconv/dxbc_signature.cpp b/src/airconv/dxbc_signature.cpp
+index b366ae3..1ab4017 100644
+--- a/src/airconv/dxbc_signature.cpp
++++ b/src/airconv/dxbc_signature.cpp
+@@ -637,7 +637,10 @@ void handle_signature_ps(
+           });
+         }
+         if (declared_type == RegisterComponentType::Float &&
+-            ctx.unorm_output_reg_mask & (1 << reg))
++            ctx.a8_output_reg_mask & (1 << reg))
++          ctx.epilogue >> pop_output_reg_a8(reg, mask, assigned_index);
++        else if (declared_type == RegisterComponentType::Float &&
++                 ctx.unorm_output_reg_mask & (1 << reg))
+           ctx.epilogue >> pop_output_reg_fix_unorm(reg, mask, assigned_index);
+         else
+           ctx.epilogue >> pop_output_reg(reg, mask, assigned_index);
+diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
+index 5b00f63..3562ab5 100644
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -957,6 +957,7 @@ public:
+         // workaround: mipmap generation of a8unorm is borked, so use a r8unorm view
+         auto fixedViewId = viewId;
+-        if (tex->pixelFormat(viewId) == WMTPixelFormatA8Unorm) {
++        if (tex->pixelFormat(viewId) == WMTPixelFormatA8Unorm ||
++            IsEmulatedA8Format(tex->pixelFormat(viewId))) {
+           fixedViewId = tex->checkViewUseFormat(viewId, WMTPixelFormatR8Unorm);
+         }
+         WMT::Texture texture = enc.access(tex, fixedViewId, ResourceAccess::ReadWrite).texture;
+@@ -4673,6 +4673,8 @@ public:
+   ClearRenderTargetView(D3D11RenderTargetView *pRenderTargetView, const FLOAT ColorRGBA[4]) {
+     InvalidateCurrentPass();
+     auto clear_color = WMTClearColor{ColorRGBA[0], ColorRGBA[1], ColorRGBA[2], ColorRGBA[3]};
++    if (IsEmulatedA8Format(pRenderTargetView->pixelFormat()))
++      clear_color.r = clear_color.a;
+     auto &props = pRenderTargetView->description();
+ 
+     EmitOP([texture = pRenderTargetView->texture(), view = pRenderTargetView->viewId(),
+diff --git a/src/d3d11/d3d11_pipeline.cpp b/src/d3d11/d3d11_pipeline.cpp
+index ef1d783..8215660 100644
+--- a/src/d3d11/d3d11_pipeline.cpp
++++ b/src/d3d11/d3d11_pipeline.cpp
+@@ -20,11 +20,13 @@ public:
+         RasterizationEnabled(pDesc->RasterizationEnabled),
+         SampleCount(pDesc->SampleCount) {
+     uint32_t unorm_output_reg_mask = 0;
++    uint32_t a8_output_reg_mask = 0;
+     uint32_t uint_output_reg_mask = 0;
+     uint32_t sint_output_reg_mask = 0;
+     for (unsigned i = 0; i < num_rtvs; i++) {
+       rtv_formats[i] = pDesc->ColorAttachmentFormats[i];
+       unorm_output_reg_mask |= (uint32_t(IsUnorm8RenderTargetFormat(pDesc->ColorAttachmentFormats[i])) << i);
++      a8_output_reg_mask |= (uint32_t(IsEmulatedA8Format(pDesc->ColorAttachmentFormats[i])) << i);
+       uint_output_reg_mask |= (uint32_t(IsUintColorFormat(pDesc->ColorAttachmentFormats[i])) << i);
+       sint_output_reg_mask |= (uint32_t(IsSintColorFormat(pDesc->ColorAttachmentFormats[i])) << i);
+     }
+@@ -42,7 +44,7 @@ public:
+       PixelShader = pDesc->PixelShader->get_shader(ShaderVariantPixel{
+           pDesc->SampleMask, pDesc->BlendState->IsDualSourceBlending(),
+           depth_stencil_format == WMTPixelFormatInvalid,
+-          unorm_output_reg_mask, uint_output_reg_mask,
++          unorm_output_reg_mask, a8_output_reg_mask, uint_output_reg_mask,
+           sint_output_reg_mask});
+       ps_valid_render_targets = pDesc->PixelShader->reflection().PSValidRenderTargets;
+       ps_uint_output_registers = pDesc->PixelShader->reflection().PSUintOutputRegisterMask;
+diff --git a/src/d3d11/d3d11_pipeline_gs.cpp b/src/d3d11/d3d11_pipeline_gs.cpp
+index 43ef039..101e1e9 100644
+--- a/src/d3d11/d3d11_pipeline_gs.cpp
++++ b/src/d3d11/d3d11_pipeline_gs.cpp
+@@ -37,6 +37,7 @@ public:
+     if (pDesc->RasterizationEnabled && !pDesc->PixelShader)
+       num_rtvs = 0;
+     uint32_t unorm_output_reg_mask = 0;
++    uint32_t a8_output_reg_mask = 0;
+     uint32_t uint_output_reg_mask = 0;
+     uint32_t sint_output_reg_mask = 0;
+     for (unsigned i = 0; i < num_rtvs; i++) {
+@@ -44,6 +45,8 @@ public:
+       unorm_output_reg_mask |= (uint32_t(IsUnorm8RenderTargetFormat(
+                                     pDesc->ColorAttachmentFormats[i]))
+                                 << i);
++      a8_output_reg_mask |=
++          (uint32_t(IsEmulatedA8Format(pDesc->ColorAttachmentFormats[i])) << i);
+       uint_output_reg_mask |=
+           (uint32_t(IsUintColorFormat(pDesc->ColorAttachmentFormats[i])) << i);
+       sint_output_reg_mask |=
+@@ -60,7 +63,7 @@ public:
+       PixelShader = pDesc->PixelShader->get_shader(ShaderVariantPixel{
+           pDesc->SampleMask, pDesc->BlendState->IsDualSourceBlending(),
+           depth_stencil_format == WMTPixelFormatInvalid,
+-          unorm_output_reg_mask, uint_output_reg_mask,
++          unorm_output_reg_mask, a8_output_reg_mask, uint_output_reg_mask,
+           sint_output_reg_mask});
+       ps_valid_render_targets = pDesc->PixelShader->reflection().PSValidRenderTargets;
+       ps_uint_output_registers = pDesc->PixelShader->reflection().PSUintOutputRegisterMask;
+diff --git a/src/d3d11/d3d11_pipeline_ts.cpp b/src/d3d11/d3d11_pipeline_ts.cpp
+index bcf4b2d..ec0a3c7 100644
+--- a/src/d3d11/d3d11_pipeline_ts.cpp
++++ b/src/d3d11/d3d11_pipeline_ts.cpp
+@@ -40,6 +40,7 @@ public:
+     if (pDesc->RasterizationEnabled && !pDesc->PixelShader)
+       num_rtvs = 0;
+     uint32_t unorm_output_reg_mask = 0;
++    uint32_t a8_output_reg_mask = 0;
+     uint32_t uint_output_reg_mask = 0;
+     uint32_t sint_output_reg_mask = 0;
+     for (unsigned i = 0; i < num_rtvs; i++) {
+@@ -47,6 +48,8 @@ public:
+       unorm_output_reg_mask |= (uint32_t(IsUnorm8RenderTargetFormat(
+                                     pDesc->ColorAttachmentFormats[i]))
+                                 << i);
++      a8_output_reg_mask |=
++          (uint32_t(IsEmulatedA8Format(pDesc->ColorAttachmentFormats[i])) << i);
+       uint_output_reg_mask |=
+           (uint32_t(IsUintColorFormat(pDesc->ColorAttachmentFormats[i])) << i);
+       sint_output_reg_mask |=
+@@ -80,7 +83,7 @@ public:
+       PixelShader = pDesc->PixelShader->get_shader(ShaderVariantPixel{
+           pDesc->SampleMask, pDesc->BlendState->IsDualSourceBlending(),
+           depth_stencil_format == WMTPixelFormatInvalid,
+-          unorm_output_reg_mask, uint_output_reg_mask,
++          unorm_output_reg_mask, a8_output_reg_mask, uint_output_reg_mask,
+           sint_output_reg_mask});
+       ps_valid_render_targets = pDesc->PixelShader->reflection().PSValidRenderTargets;
+       ps_uint_output_registers = pDesc->PixelShader->reflection().PSUintOutputRegisterMask;
+diff --git a/src/d3d11/d3d11_resource_view_helper.cpp b/src/d3d11/d3d11_resource_view_helper.cpp
+index 4d1214d..0abe3d7 100644
+--- a/src/d3d11/d3d11_resource_view_helper.cpp
++++ b/src/d3d11/d3d11_resource_view_helper.cpp
+@@ -335,6 +335,12 @@ HRESULT InitializeAndNormalizeViewDescriptor(
+     return E_FAIL;
+   }
+ 
++  /* A swizzled R8 view is used when this resource is sampled, but Metal
++   * render attachments must use the ordinary R8 view. The RTV object keeps
++   * the emulated format marker separately for shader and blend setup. */
++  if (metal_format.Flag & MTL_DXGI_FORMAT_EMULATED_A8)
++    metal_format.PixelFormat = WMTPixelFormatR8Unorm;
++
+   AttachmentDesc.DepthPlane = 0;
+   AttachmentDesc.RenderTargetArrayLength = 0;
+   AttachmentDesc.SampleCount = pTexture->sampleCount();
+diff --git a/src/d3d11/d3d11_shader.cpp b/src/d3d11/d3d11_shader.cpp
+index 631c2c8..609822a 100644
+--- a/src/d3d11/d3d11_shader.cpp
++++ b/src/d3d11/d3d11_shader.cpp
+@@ -170,6 +170,7 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
+   h.update(getGlobalShaderFlag());
+   h.update(variant.sample_mask);
+   h.update(variant.unorm_output_reg_mask);
++  h.update(variant.a8_output_reg_mask);
+   h.update(variant.uint_output_reg_mask);
+   h.update(variant.sint_output_reg_mask);
+   h.update(variant.dual_source_blending);
+@@ -185,6 +186,7 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
+     data.dual_source_blending = variant.dual_source_blending;
+     data.disable_depth_output = variant.disable_depth_output;
+     data.unorm_output_reg_mask = variant.unorm_output_reg_mask;
++    data.a8_output_reg_mask = variant.a8_output_reg_mask;
+     data.uint_output_reg_mask = variant.uint_output_reg_mask;
+     data.sint_output_reg_mask = variant.sint_output_reg_mask;
+ 
+diff --git a/src/d3d11/d3d11_shader.hpp b/src/d3d11/d3d11_shader.hpp
+index 40e6353..926b556 100644
+--- a/src/d3d11/d3d11_shader.hpp
++++ b/src/d3d11/d3d11_shader.hpp
+@@ -104,6 +104,7 @@ struct ShaderVariantPixel {
+   bool dual_source_blending;
+   bool disable_depth_output;
+   uint32_t unorm_output_reg_mask;
++  uint32_t a8_output_reg_mask;
+   uint32_t uint_output_reg_mask;
+   uint32_t sint_output_reg_mask;
+   bool operator==(const this_type &rhs) const {
+@@ -111,6 +112,7 @@ struct ShaderVariantPixel {
+            dual_source_blending == rhs.dual_source_blending &&
+            disable_depth_output == rhs.disable_depth_output &&
+            unorm_output_reg_mask == rhs.unorm_output_reg_mask &&
++           a8_output_reg_mask == rhs.a8_output_reg_mask &&
+            uint_output_reg_mask == rhs.uint_output_reg_mask &&
+            sint_output_reg_mask == rhs.sint_output_reg_mask;
+   }
+diff --git a/src/d3d11/d3d11_state_object.cpp b/src/d3d11/d3d11_state_object.cpp
+index 403e42b..c4c8554 100644
+--- a/src/d3d11/d3d11_state_object.cpp
++++ b/src/d3d11/d3d11_state_object.cpp
+@@ -159,6 +159,32 @@ constexpr WMTBlendFactor kBlendAlphaFactorMap[] = {
+     WMTBlendFactorOneMinusSource1Alpha,
+ };
+ 
++/* The emulated A8 attachment is physically R8. Route the D3D alpha
++ * equation through Metal's RGB equation and make every destination-alpha
++ * factor read the stored red component rather than Metal's implicit 1. */
++constexpr WMTBlendFactor kA8BlendFactorMap[] = {
++    WMTBlendFactorZero, // padding 0
++    WMTBlendFactorZero,
++    WMTBlendFactorOne,
++    WMTBlendFactorSourceAlpha,
++    WMTBlendFactorOneMinusSourceAlpha,
++    WMTBlendFactorSourceAlpha,
++    WMTBlendFactorOneMinusSourceAlpha,
++    WMTBlendFactorDestinationColor,
++    WMTBlendFactorOneMinusDestinationColor,
++    WMTBlendFactorDestinationColor,
++    WMTBlendFactorOneMinusDestinationColor,
++    WMTBlendFactorOne, // SRC_ALPHA_SAT is 1 for the alpha component
++    WMTBlendFactorZero,
++    WMTBlendFactorZero,
++    WMTBlendFactorBlendAlpha,
++    WMTBlendFactorOneMinusBlendAlpha,
++    WMTBlendFactorSource1Alpha,
++    WMTBlendFactorOneMinusSource1Alpha,
++    WMTBlendFactorSource1Alpha,
++    WMTBlendFactorOneMinusSource1Alpha,
++};
++
+ constexpr WMTColorWriteMask kColorWriteMaskMap[] = {
+     // 0000
+     WMTColorWriteMaskNone,
+@@ -321,19 +347,29 @@ public:
+       auto i = desc_.IndependentBlendEnable ? rt : 0;
+       auto &renderTarget = desc_.RenderTarget[i];
+       auto &attachment_desc = info->colors[rt];
+-      attachment_desc.write_mask = kColorWriteMaskMap[renderTarget.RenderTargetWriteMask];
++      auto emulated_a8 = IsEmulatedA8Format(attachment_desc.pixel_format);
++      attachment_desc.write_mask = emulated_a8
++          ? ((renderTarget.RenderTargetWriteMask & D3D11_COLOR_WRITE_ENABLE_ALPHA)
++                 ? WMTColorWriteMaskRed
++                 : WMTColorWriteMaskNone)
++          : kColorWriteMaskMap[renderTarget.RenderTargetWriteMask];
+       if (renderTarget.BlendEnable && attachment_desc.pixel_format != WMTPixelFormatInvalid) {
+         if (!any_bit_set(m_parent->GetMTLPixelFormatCapability(attachment_desc.pixel_format) & FormatCapability::Blend)) {
+           WARN("Blending is enabled on RTV of non-blendable format ", attachment_desc.pixel_format);
+           continue;
+         }
+         attachment_desc.alpha_blend_operation = kBlendOpMap[renderTarget.BlendOpAlpha];
+-        attachment_desc.rgb_blend_operation = kBlendOpMap[renderTarget.BlendOp];
++        attachment_desc.rgb_blend_operation =
++            kBlendOpMap[emulated_a8 ? renderTarget.BlendOpAlpha : renderTarget.BlendOp];
+         attachment_desc.blending_enabled = renderTarget.BlendEnable;
+         attachment_desc.src_alpha_blend_factor = kBlendAlphaFactorMap[renderTarget.SrcBlendAlpha];
+-        attachment_desc.src_rgb_blend_factor = kBlendFactorMap[renderTarget.SrcBlend];
++        attachment_desc.src_rgb_blend_factor = emulated_a8
++            ? kA8BlendFactorMap[renderTarget.SrcBlendAlpha]
++            : kBlendFactorMap[renderTarget.SrcBlend];
+         attachment_desc.dst_alpha_blend_factor = kBlendAlphaFactorMap[renderTarget.DestBlendAlpha];
+-        attachment_desc.dst_rgb_blend_factor = kBlendFactorMap[renderTarget.DestBlend];
++        attachment_desc.dst_rgb_blend_factor = emulated_a8
++            ? kA8BlendFactorMap[renderTarget.DestBlendAlpha]
++            : kBlendFactorMap[renderTarget.DestBlend];
+       }
+     }
+     /*
+diff --git a/src/d3d11/d3d11_texture_device.cpp b/src/d3d11/d3d11_texture_device.cpp
+index 12472c4..268673e 100644
+--- a/src/d3d11/d3d11_texture_device.cpp
++++ b/src/d3d11/d3d11_texture_device.cpp
+@@ -203,6 +203,19 @@ public:
+         ))) {
+       return E_FAIL;
+     }
++    auto view_format = descriptor.format;
++    MTL_DXGI_FORMAT_DESC view_format_desc;
++    if (SUCCEEDED(MTLQueryDXGIFormat(this->m_parent->GetMTLDevice(), finalDesc.Format, view_format_desc)) &&
++        (view_format_desc.Flag & MTL_DXGI_FORMAT_EMULATED_A8))
++      view_format = view_format_desc.PixelFormat;
++    auto capability = this->m_parent->GetMTLPixelFormatCapability(descriptor.format);
++    if (!any_bit_set(capability & FormatCapability::Color)) {
++      WARN(
++          "CreateRenderTargetView: rejecting non-color-renderable Metal format ",
++          descriptor.format, " for DXGI format ", (uint32_t)finalDesc.Format
++      );
++      return E_FAIL;
++    }
+     if (IsIntegerColorFormat(descriptor.format))
+       WARN("integer-format RTV: view_dxgi=", (uint32_t)finalDesc.Format,
+            " res_dxgi=", (uint32_t)this->desc.Format,
+@@ -211,7 +224,7 @@ public:
+     if (!ppView) {
+       return S_FALSE;
+     }
+-    *ppView = ref(new TextureRTV(descriptor, descriptor.format, &finalDesc, this, this->m_parent, attachment_desc));
++    *ppView = ref(new TextureRTV(descriptor, view_format, &finalDesc, this, this->m_parent, attachment_desc));
+     return S_OK;
+   };
+ 
+diff --git a/src/d3d12/d3d12_pipeline_graphics.cpp b/src/d3d12/d3d12_pipeline_graphics.cpp
+index e60abc4..3ae40a1 100644
+--- a/src/d3d12/d3d12_pipeline_graphics.cpp
++++ b/src/d3d12/d3d12_pipeline_graphics.cpp
+@@ -415,6 +415,7 @@ public:
+       data_ps.dual_source_blending = dual_source_blending;
+       data_ps.disable_depth_output = false;
+       data_ps.unorm_output_reg_mask = 0;
++      data_ps.a8_output_reg_mask = 0;
+       data_ps.uint_output_reg_mask = 0;
+       data_ps.sint_output_reg_mask = 0;
+       data_ps.sample_mask = pDesc->SampleMask;
+diff --git a/src/dxmt/dxmt_format.cpp b/src/dxmt/dxmt_format.cpp
+index 8baa6cb..674a3a5 100644
+--- a/src/dxmt/dxmt_format.cpp
++++ b/src/dxmt/dxmt_format.cpp
+@@ -39,7 +39,11 @@ void
+ FormatCapabilityInspector::Inspect(WMT::Device device) {
+   if (device.supportsFamily(WMTGPUFamilyApple7)) {
+     // Apple 7: M1
+-    APPEND_CAP(WMTPixelFormatA8Unorm, ALL_CAP | TEXTURE_BUFFER_ALL_CAP)
++    // A8Unorm is sampleable but is not a color-renderable or blendable
++    // attachment on Apple-family iOS devices. Advertising ALL_CAP causes
++    // Metal pipeline validation to abort the process when DWM uses an A8
++    // render target for glyphs or alpha masks.
++    APPEND_CAP(WMTPixelFormatA8Unorm, FormatCapability::Filter)
+     APPEND_CAP(WMTPixelFormatR8Unorm, ALL_CAP | TEXTURE_BUFFER_ALL_CAP)
+     APPEND_CAP(WMTPixelFormatR8Unorm_sRGB, ALL_CAP)
+     APPEND_CAP(WMTPixelFormatR8Snorm, ALL_CAP | TEXTURE_BUFFER_READ_OR_WRITE)
+@@ -853,7 +857,12 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
+     break;
+   }
+   case DXGI_FORMAT_A8_UNORM: {
+-    description.PixelFormat = WMTPixelFormatA8Unorm;
++    if (device.supportsFamily(WMTGPUFamilyApple7)) {
++      description.PixelFormat = WMTPixelFormatA8UnormEmulated;
++      description.Flag = MTL_DXGI_FORMAT_EMULATED_A8;
++    } else {
++      description.PixelFormat = WMTPixelFormatA8Unorm;
++    }
+     description.BytesPerTexel = 1;
+     break;
+   }
+@@ -1371,7 +1380,7 @@ MTLGetUnsignedIntegerFormat(WMTPixelFormat format) {
+ 
+ bool
+ IsUnorm8RenderTargetFormat(WMTPixelFormat format) {
+-  switch (format) {
++  switch (ORIGINAL_FORMAT(format)) {
+   case WMTPixelFormatA8Unorm:
+   case WMTPixelFormatR8Unorm:
+   case WMTPixelFormatRG8Unorm:
+diff --git a/src/dxmt/dxmt_format.hpp b/src/dxmt/dxmt_format.hpp
+index e1ae628..0929d53 100644
+--- a/src/dxmt/dxmt_format.hpp
++++ b/src/dxmt/dxmt_format.hpp
+@@ -95,6 +95,9 @@ enum MTL_DXGI_FORMAT_FLAG {
+   /* device has no BC support: PixelFormat is the uncompressed stand-in,
+    * EmulatedBC the original BC format; uploads decompress on the CPU */
+   MTL_DXGI_FORMAT_EMULATED_BC = 1024,
++  /* Apple-family Metal cannot render to A8Unorm. Store it as R8Unorm
++   * and preserve D3D alpha-only semantics in views and pipelines. */
++  MTL_DXGI_FORMAT_EMULATED_A8 = 2048,
+ };
+ 
+ struct MTL_DXGI_FORMAT_DESC {
+@@ -117,6 +120,11 @@ WMTPixelFormat MTLGetUnsignedIntegerFormat(WMTPixelFormat format);
+ 
+ bool IsUnorm8RenderTargetFormat(WMTPixelFormat format);
+ 
++inline bool
++IsEmulatedA8Format(WMTPixelFormat format) {
++  return format == WMTPixelFormatA8UnormEmulated;
++}
++
+ bool IsIntegerFormat(WMTPixelFormat format);
+ 
+ void SanitizeRTVClearColor(WMTPixelFormat format, WMTClearColor &color);
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+index 5b12cd9..40e0cb5 100644
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -1981,6 +1981,9 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA32 {
+   bool dual_source_blending;
+   bool disable_depth_output;
+   uint32_t unorm_output_reg_mask;
++  uint32_t a8_output_reg_mask;
++  uint32_t uint_output_reg_mask;
++  uint32_t sint_output_reg_mask;
+ };
+ 
+ struct SM50_SHADER_GS_PASS_THROUGH_DATA32 {
+@@ -2059,6 +2062,9 @@ sm50_compilation_argument32_convert(
+       last_arg->next = NULL;
+       data->type = src->type;
+       data->unorm_output_reg_mask = src->unorm_output_reg_mask;
++      data->a8_output_reg_mask = src->a8_output_reg_mask;
++      data->uint_output_reg_mask = src->uint_output_reg_mask;
++      data->sint_output_reg_mask = src->sint_output_reg_mask;
+       data->disable_depth_output = src->disable_depth_output;
+       data->sample_mask = src->sample_mask;
+       data->dual_source_blending = src->dual_source_blending;
+diff --git a/src/winemetal/winemetal.h b/src/winemetal/winemetal.h
+index 37dd641..5780207 100644
+--- a/src/winemetal/winemetal.h
++++ b/src/winemetal/winemetal.h
+@@ -449,6 +449,8 @@ enum WMTPixelFormat : uint32_t {
+   WMTPixelFormatR001Swizzle = 0b000011010010u << 12,
+   WMTPixelFormat0R01Swizzle = 0b100101010010u << 12,
+   WMTPixelFormatGBARSwizzle = 0b001001001011u << 12,
++  /* Alpha-only data stored in an R8 texture: sample as (0, 0, 0, R). */
++  WMTPixelFormat000RSwizzle = 0b100011010011u << 12,
+   WMTPixelFormatRGB1Swizzle = WMTPixelFormatAlphaIsOne,
+ 
+   WMTPixelFormatBGRX8Unorm = WMTPixelFormatAlphaIsOne | WMTPixelFormatBGRA8Unorm,
+@@ -458,6 +460,7 @@ enum WMTPixelFormat : uint32_t {
+   WMTPixelFormatX32G8X32 = WMTPixelFormat0R01Swizzle | WMTPixelFormatX32_Stencil8,
+ 
+   WMTPixelFormatBGRA4Unorm = WMTPixelFormatGBARSwizzle | WMTPixelFormatABGR4Unorm,
++  WMTPixelFormatA8UnormEmulated = WMTPixelFormat000RSwizzle | WMTPixelFormatR8Unorm,
+ };
+ 
+ #define ORIGINAL_FORMAT(format) ((format) & ~WMTPixelFormatCustomSwizzle)
