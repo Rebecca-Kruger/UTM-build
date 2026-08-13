@@ -1,0 +1,74 @@
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+index 4be71ce..8b290d3 100644
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -781,0 +782,6 @@ public:
++    bool display_settings_changed = presenter->refreshDisplaySettings();
++    if (display_settings_changed) {
++      DEBUG("Waiting for GPU idle before applying display settings");
++      device_context_->WaitUntilGPUIdle();
++      DEBUG("GPU idle before display settings update");
++    }
+@@ -818,0 +825,6 @@ public:
++    if (display_settings_changed) {
++      DEBUG("Waiting for display transition frame ", presentation_count_);
++      cmd_queue.WaitCPUFence(cmd_queue.CurrentSeqId() - 1);
++      DEBUG("Display transition frame completed");
++    }
++
+diff --git a/src/dxmt/dxmt_command_queue.cpp b/src/dxmt/dxmt_command_queue.cpp
+index 89ffc37..209055e 100644
+--- a/src/dxmt/dxmt_command_queue.cpp
++++ b/src/dxmt/dxmt_command_queue.cpp
+@@ -27 +27,2 @@
+-#define ASYNC_ENCODING 1
++// Keep Metal layer transitions from overlapping command-buffer encoding on iOS.
++#define ASYNC_ENCODING 0
+@@ -113,0 +115,3 @@ CommandQueue::CommitCurrentChunk() {
++  auto t0 = clock::now();
++  chunk_ongoing.wait(1, std::memory_order_acquire);
++  chunk_ongoing.fetch_add(1, std::memory_order_relaxed);
+@@ -114,0 +119,2 @@ CommandQueue::CommitCurrentChunk() {
++  auto t1 = clock::now();
++  statistics.commit_interval += (t1 - t0);
+diff --git a/src/dxmt/dxmt_command_queue.hpp b/src/dxmt/dxmt_command_queue.hpp
+index e109af7..7014d53 100644
+--- a/src/dxmt/dxmt_command_queue.hpp
++++ b/src/dxmt/dxmt_command_queue.hpp
+@@ -173 +173 @@ private:
+-  uint32_t max_latency_ = 3;
++  uint32_t max_latency_ = 1;
+diff --git a/src/dxmt/dxmt_presenter.cpp b/src/dxmt/dxmt_presenter.cpp
+index 86c9d72..9553682 100644
+--- a/src/dxmt/dxmt_presenter.cpp
++++ b/src/dxmt/dxmt_presenter.cpp
+@@ -5,0 +6 @@
++#include "log/log.hpp"
+@@ -104,2 +105,2 @@ Presenter::changeGammaRamp(const DXMTGammaRamp *gamma_ramp) {
+-Presenter::PresentState
+-Presenter::synchronizeLayerProperties() {
++bool
++Presenter::refreshDisplaySettings() {
+@@ -112,4 +113,2 @@ Presenter::synchronizeLayerProperties() {
+-  if (display_setting_version != display_setting_version_) {
+-    display_setting_version_ = display_setting_version;
+-    pso_valid.clear();
+-  }
++  if (display_setting_version == display_setting_version_)
++    return false;
+@@ -116,0 +116,8 @@ Presenter::synchronizeLayerProperties() {
++  DEBUG("Display settings changed from version ", display_setting_version_, " to ", display_setting_version);
++  display_setting_version_ = display_setting_version;
++  pso_valid.clear();
++  return true;
++}
++
++Presenter::PresentState
++Presenter::synchronizeLayerProperties() {
+diff --git a/src/dxmt/dxmt_presenter.hpp b/src/dxmt/dxmt_presenter.hpp
+index 77eb35c..2879225 100644
+--- a/src/dxmt/dxmt_presenter.hpp
++++ b/src/dxmt/dxmt_presenter.hpp
+@@ -41,0 +42,2 @@ public:
++  bool refreshDisplaySettings();
++

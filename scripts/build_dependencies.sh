@@ -258,6 +258,7 @@ download_all () {
     # idempotently.
     git -C "$DXMT_DIR" reset --hard "$DXMT_COMMIT"
     git -C "$DXMT_DIR" apply "$PATCHES_DIR/dxmt-a8unorm-emulation.patch"
+    git -C "$DXMT_DIR" apply --unidiff-zero "$PATCHES_DIR/dxmt-display-transition-serialization.patch"
     clone $D3DMETAL_REPO $D3DMETAL_COMMIT
 }
 
