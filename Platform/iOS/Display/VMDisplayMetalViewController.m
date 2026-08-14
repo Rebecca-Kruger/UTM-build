@@ -37,6 +37,9 @@ static const NSInteger kResizeTimeoutSecs = 5;
 @property (nonatomic, nullable) id debounceResize;
 @property (nonatomic, nullable) id cancelResize;
 @property (nonatomic) BOOL ignoreNextResize;
+@property (nonatomic) BOOL isDisplayViewVisible;
+@property (nonatomic) BOOL isRendererAttached;
+@property (nonatomic) BOOL isPresentationSuspended;
 
 @end
 
@@ -97,6 +100,18 @@ static const NSInteger kResizeTimeoutSecs = 5;
                        downscaler:self.delegate.qemuDisplayDownscaler];
     
     self.mtkView.delegate = self.renderer;
+
+    NSNotificationCenter *notificationCenter = NSNotificationCenter.defaultCenter;
+    [notificationCenter addObserver:self
+                           selector:@selector(applicationWillResignActive:)
+                               name:UIApplicationWillResignActiveNotification
+                             object:nil];
+    [notificationCenter addObserver:self
+                           selector:@selector(applicationDidBecomeActive:)
+                               name:UIApplicationDidBecomeActiveNotification
+                             object:nil];
+    self.isPresentationSuspended = UIApplication.sharedApplication.applicationState != UIApplicationStateActive;
+    self.mtkView.paused = self.isPresentationSuspended;
     
     [self initTouch];
     [self initGamepad];
@@ -117,20 +132,26 @@ static const NSInteger kResizeTimeoutSecs = 5;
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
+    self.isDisplayViewVisible = YES;
     self.prefersHomeIndicatorAutoHidden = YES;
 #if !TARGET_OS_VISION
     [self startGCMouse];
 #endif
-    [self.vmDisplay addRenderer:self.renderer];
+    [self updateRendererAttachment];
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
     [super viewWillDisappear:animated];
+    self.isDisplayViewVisible = NO;
 #if !TARGET_OS_VISION
     [self stopGCMouse];
 #endif
-    [self.vmDisplay removeRenderer:self.renderer];
+    [self updateRendererAttachment];
     [self removeObserver:self forKeyPath:@"vmDisplay.displaySize"];
+}
+
+- (void)dealloc {
+    [NSNotificationCenter.defaultCenter removeObserver:self];
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -188,6 +209,54 @@ static const NSInteger kResizeTimeoutSecs = 5;
     }
 }
 
+#pragma mark - Application lifecycle
+
+- (void)applicationWillResignActive:(NSNotification *)notification {
+    [self setPresentationSuspended:YES reason:@"will-resign-active"];
+}
+
+- (void)applicationDidBecomeActive:(NSNotification *)notification {
+    [self setPresentationSuspended:NO reason:@"did-become-active"];
+}
+
+- (void)setPresentationSuspended:(BOOL)suspended reason:(NSString *)reason {
+    if (self.isPresentationSuspended == suspended) {
+        UTMLog(@"GPU LIFECYCLE: presentation-%@ duplicate reason=%@ attached=%d",
+               suspended ? @"suspend" : @"resume", reason, self.isRendererAttached);
+        return;
+    }
+
+    UTMLog(@"GPU LIFECYCLE: presentation-%@-begin reason=%@ attached=%d",
+           suspended ? @"suspend" : @"resume", reason, self.isRendererAttached);
+    self.isPresentationSuspended = suspended;
+    if (suspended) {
+        // Stop MetalKit before detaching the Spice renderer. This prevents a
+        // new host presentation from racing iOS as it backgrounds the AGX
+        // workload for Control Center, while retaining every GPU resource.
+        self.mtkView.paused = YES;
+        [self updateRendererAttachment];
+    } else {
+        // Reattach the existing renderer and resources before restarting the
+        // draw loop. The VM and guest CPU remain running during suspension.
+        [self updateRendererAttachment];
+        self.mtkView.paused = NO;
+        [self.mtkView setNeedsDisplay];
+    }
+    UTMLog(@"GPU LIFECYCLE: presentation-%@-end reason=%@ attached=%d",
+           suspended ? @"suspend" : @"resume", reason, self.isRendererAttached);
+}
+
+- (void)updateRendererAttachment {
+    BOOL shouldAttach = self.isDisplayViewVisible && !self.isPresentationSuspended;
+    if (shouldAttach && !self.isRendererAttached) {
+        [self.vmDisplay addRenderer:self.renderer];
+        self.isRendererAttached = YES;
+    } else if (!shouldAttach && self.isRendererAttached) {
+        [self.vmDisplay removeRenderer:self.renderer];
+        self.isRendererAttached = NO;
+    }
+}
+
 #pragma mark - Key handling
 
 - (void)showKeyboard {
@@ -238,9 +307,12 @@ static const NSInteger kResizeTimeoutSecs = 5;
 
 - (void)setVmDisplay:(CSDisplay *)display {
     if (self.renderer) {
-        [_vmDisplay removeRenderer:self.renderer];
+        if (self.isRendererAttached) {
+            [_vmDisplay removeRenderer:self.renderer];
+            self.isRendererAttached = NO;
+        }
         _vmDisplay = display;
-        [display addRenderer:self.renderer];
+        [self updateRendererAttachment];
     }
 }
 
