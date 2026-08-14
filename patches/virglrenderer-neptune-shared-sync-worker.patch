@@ -1,0 +1,491 @@
+diff --git a/src/neptune/npt_context.c b/src/neptune/npt_context.c
+index fa6c750..802624d 100644
+--- a/src/neptune/npt_context.c
++++ b/src/neptune/npt_context.c
+@@ -393,6 +393,9 @@ npt_context_create(uint32_t ctx_id,
+    if (mtx_init(&ctx->sync_queues_mutex, mtx_plain) != thrd_success)
+       goto err_sync_queues_mutex;
+
++   if (!npt_queue_worker_init(ctx))
++      goto err_sync_worker;
++
+    if (!npt_event_init(ctx))
+       goto err_event;
+
+@@ -430,6 +433,8 @@ err_object_table:
+ err_object_mutex:
+    npt_event_fini(ctx);
+ err_event:
++   npt_queue_worker_fini(ctx);
++err_sync_worker:
+    mtx_destroy(&ctx->sync_queues_mutex);
+ err_sync_queues_mutex:
+    _mesa_hash_table_destroy(ctx->pending_blob_table, NULL);
+@@ -461,6 +466,9 @@ npt_context_destroy(struct npt_context *ctx)
+     * mid-teardown. */
+    npt_context_ring_monitor_fini(ctx);
+
++   /* Stop the shared fence worker before freeing any queue it scans. */
++   npt_queue_worker_fini(ctx);
++
+    /* Context destruction is single-threaded; no ring_mutex needed. */
+    list_for_each_entry_safe (struct npt_ring, ring, &ctx->rings, head) {
+       npt_ring_stop(ring);
+diff --git a/src/neptune/npt_context.h b/src/neptune/npt_context.h
+index 46ac7fa..21cce07 100644
+--- a/src/neptune/npt_context.h
++++ b/src/neptune/npt_context.h
+@@ -140,6 +140,18 @@ struct npt_context {
+    mtx_t sync_queues_mutex;
+    struct npt_queue *sync_queues[64];
+
++   /* One poll worker services the head fence of every event queue. */
++   struct {
++      mtx_t mutex;
++      thrd_t thread;
++      int wake_read_fd;
++      int wake_write_fd;
++      bool join;
++      uint32_t pending_fences;
++      uint32_t pending_high_water;
++      uint32_t queues_high_water;
++   } sync_worker;
++
+    /* Win32 event HANDLE emulation: each proxy owns an eventfd handed
+     * to the host D3D library as the HANDLE.  event_pending_arms
+     * carries (ring_idx, dup_fd) triples; the next matching
+diff --git a/src/neptune/npt_queue.c b/src/neptune/npt_queue.c
+index f6d518a..4abc73b 100644
+--- a/src/neptune/npt_queue.c
++++ b/src/neptune/npt_queue.c
+@@ -11,6 +11,7 @@
+ #include <errno.h>
+ #include <inttypes.h>
+ #include <poll.h>
++#include <fcntl.h>
+ #include <time.h>
+ #include <unistd.h>
+
+@@ -22,6 +23,14 @@
+ /* sync alloc / free / retire                                          */
+ /* ----------------------------------------------------------------- */
+
++static uint64_t
++npt_queue_monotonic_ns(void)
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++}
++
+ static struct npt_queue_sync *
+ npt_queue_alloc_sync(uint32_t flags,
+                      uint32_t ring_idx,
+@@ -36,7 +45,7 @@ npt_queue_alloc_sync(uint32_t flags,
+    sync->flags    = flags;
+    sync->ring_idx = ring_idx;
+    sync->fence_id = fence_id;
+-   sync->timeouts = 0;
++   sync->deadline_ns = npt_queue_monotonic_ns() + 30000000000ull;
+
+    return sync;
+ }
+@@ -76,11 +85,17 @@ npt_queue_sync_submit(struct npt_queue *queue,
+       return false;
+    }
+
+-   /* Append to the queue's sync list and wake the worker. */
+-   mtx_lock(&queue->sync_thread.mutex);
+-   list_addtail(&sync->head, &queue->sync_thread.syncs);
+-   cnd_signal(&queue->sync_thread.cond);
+-   mtx_unlock(&queue->sync_thread.mutex);
++   struct npt_context *ctx = queue->context;
++   mtx_lock(&ctx->sync_worker.mutex);
++   list_addtail(&sync->head, &queue->syncs);
++   ctx->sync_worker.pending_fences++;
++   if (ctx->sync_worker.pending_fences > ctx->sync_worker.pending_high_water)
++      ctx->sync_worker.pending_high_water = ctx->sync_worker.pending_fences;
++   mtx_unlock(&ctx->sync_worker.mutex);
++
++   /* Nonblocking pipe: a full pipe already means the worker is awake. */
++   const uint8_t byte = 1;
++   (void)write(ctx->sync_worker.wake_write_fd, &byte, sizeof(byte));
+
+    return true;
+ }
+@@ -89,99 +104,113 @@ npt_queue_sync_submit(struct npt_queue *queue,
+ /* worker thread                                                       */
+ /* ----------------------------------------------------------------- */
+
+-static int
+-npt_wait_sync_fd(int fd, int timeout_ms)
++static void
++npt_queue_drain_wake_fd(int fd)
+ {
+-   if (fd < 0)
+-      return 0;
+-
+-   struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+-   int ret;
+-   do {
+-      ret = poll(&pfd, 1, timeout_ms);
+-   } while (ret < 0 && errno == EINTR);
+-
+-   /* Treat POLLNVAL / POLLERR / POLLHUP and any other error as a
+-    * signal so the worker retires the fence rather than re-polling a
+-    * dead fd forever.  A concurrent close() of the sync fd can race a
+-    * poll already in flight; the sync queue is that fd's only
+-    * downstream and must not wedge. */
+-   if (ret > 0 && (pfd.revents & (POLLNVAL | POLLERR | POLLHUP)))
+-      return 1;
+-   if (ret < 0)
+-      return 1;
+-   return ret;
++   uint8_t bytes[64];
++   while (read(fd, bytes, sizeof(bytes)) > 0)
++      ;
+ }
+
+ static int
+-npt_queue_thread(void *arg)
++npt_queue_worker_thread(void *arg)
+ {
+-   struct npt_queue *queue = arg;
+-   struct npt_context *ctx = queue->context;
++   struct npt_context *ctx = arg;
+    char thread_name[16];
+-   snprintf(thread_name, sizeof(thread_name), "npt-queue-%u", ctx->ctx_id);
++   snprintf(thread_name, sizeof(thread_name), "npt-sync-%u", ctx->ctx_id);
+    u_thread_setname(thread_name);
+
+-   /* sync_thread.mutex protects the list; dropped across the poll,
+-    * reacquired before popping the entry. */
++   /* sync_worker.mutex protects every queue list; it is dropped across
++    * poll and reacquired before retiring a queue head. */
+    const int kPollTimeoutMs = 3000;
+
+-   /* Bounded device-lost bailout.  Without a clear DEVICE_LOST
+-    * signal (we only have a sync_file fd), consecutive poll
+-    * timeouts are the best evidence the producer is wedged.  After
+-    * ~30 s, retire so the guest unblocks instead of hanging forever. */
+-   const unsigned kMaxTimeouts = 10;
+-
+-   mtx_lock(&queue->sync_thread.mutex);
+    while (true) {
+-      while (list_is_empty(&queue->sync_thread.syncs) && !queue->sync_thread.join)
+-         cnd_wait(&queue->sync_thread.cond, &queue->sync_thread.mutex);
+-
+-      if (queue->sync_thread.join)
++      struct pollfd pfds[1 + 32];
++      struct npt_queue *queues[32];
++      nfds_t count = 1;
++      pfds[0] = (struct pollfd){ .fd = ctx->sync_worker.wake_read_fd,
++                                .events = POLLIN };
++
++      mtx_lock(&ctx->sync_queues_mutex);
++      mtx_lock(&ctx->sync_worker.mutex);
++      if (ctx->sync_worker.join) {
++         mtx_unlock(&ctx->sync_worker.mutex);
++         mtx_unlock(&ctx->sync_queues_mutex);
+          break;
++      }
++      for (uint32_t i = NPT_EVENT_RING_BASE;
++           i < ARRAY_SIZE(ctx->sync_queues); i++) {
++         struct npt_queue *queue = ctx->sync_queues[i];
++         if (!queue || list_is_empty(&queue->syncs))
++            continue;
++         struct npt_queue_sync *sync =
++            list_first_entry(&queue->syncs, struct npt_queue_sync, head);
++         pfds[count] = (struct pollfd){ .fd = sync->sync_fd,
++                                       .events = POLLIN };
++         queues[count - 1] = queue;
++         count++;
++      }
++      mtx_unlock(&ctx->sync_worker.mutex);
++      mtx_unlock(&ctx->sync_queues_mutex);
+
+-      struct npt_queue_sync *sync =
+-         list_first_entry(&queue->sync_thread.syncs, struct npt_queue_sync, head);
+-
+-      mtx_unlock(&queue->sync_thread.mutex);
+-
+-      struct timespec t0, t1;
+       const bool trace = NPT_DEBUG(FENCE_TRACE);
++      struct timespec t0, t1;
+       if (trace)
+          clock_gettime(CLOCK_MONOTONIC, &t0);
+-      int rc = npt_wait_sync_fd(sync->sync_fd, kPollTimeoutMs);
++      int rc;
++      do {
++         rc = poll(pfds, count, kPollTimeoutMs);
++      } while (rc < 0 && errno == EINTR);
+       if (trace)
+          clock_gettime(CLOCK_MONOTONIC, &t1);
+
+-      mtx_lock(&queue->sync_thread.mutex);
+-
+-      if (rc == 0) {
+-         /* Poll timeout: bump the counter, and once it crosses
+-          * kMaxTimeouts retire the fence anyway so a wedged host
+-          * (driver hang, missing sync_file signal) doesn't trap the
+-          * guest forever.  Healthy GPUs never hit more than one or
+-          * two timeouts in a row. */
+-         if (++sync->timeouts < kMaxTimeouts)
++      if (pfds[0].revents)
++         npt_queue_drain_wake_fd(ctx->sync_worker.wake_read_fd);
++
++      struct npt_queue *retire_queues[32];
++      struct npt_queue_sync *retire_syncs[32];
++      unsigned retire_count = 0;
++      const uint64_t now_ns = npt_queue_monotonic_ns();
++      mtx_lock(&ctx->sync_worker.mutex);
++      for (nfds_t i = 1; i < count; i++) {
++         struct npt_queue *queue = queues[i - 1];
++         if (list_is_empty(&queue->syncs))
+             continue;
+-         npt_log("queue %u fence_id=%" PRIu64 ": timed out %u times "
+-                 "(~%u s), retiring as device-lost",
+-                 queue->ring_idx, sync->fence_id, sync->timeouts,
+-                 kMaxTimeouts * (kPollTimeoutMs / 1000));
+-      }
+-
+-      if (trace) {
+-         const int64_t dt_ns =
+-            (int64_t)(t1.tv_sec  - t0.tv_sec ) * 1000000000ll +
+-            (int64_t)(t1.tv_nsec - t0.tv_nsec);
+-         const uint64_t wait_us = dt_ns > 0 ? (uint64_t)(dt_ns / 1000) : 0;
+-         npt_profile_log_q_retire(queue->ring_idx, sync->fence_id,
+-                                  sync->sync_fd, wait_us, rc);
++         struct npt_queue_sync *sync =
++            list_first_entry(&queue->syncs, struct npt_queue_sync, head);
++         bool ready = rc < 0 ||
++                      (pfds[i].revents &
++                       (POLLIN | POLLNVAL | POLLERR | POLLHUP));
++         if (!ready && now_ns >= sync->deadline_ns) {
++            ready = true;
++            npt_log("queue %u fence_id=%" PRIu64
++                    ": timed out (~30 s), retiring as device-lost",
++                    queue->ring_idx, sync->fence_id);
++         }
++         if (!ready)
++            continue;
++         if (trace) {
++            const int64_t dt_ns =
++               (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ll +
++               (int64_t)(t1.tv_nsec - t0.tv_nsec);
++            npt_profile_log_q_retire(queue->ring_idx, sync->fence_id,
++                                     sync->sync_fd,
++                                     dt_ns > 0 ? (uint64_t)(dt_ns / 1000) : 0,
++                                     rc);
++         }
++         list_del(&sync->head);
++         ctx->sync_worker.pending_fences--;
++         retire_queues[retire_count] = queue;
++         retire_syncs[retire_count] = sync;
++         retire_count++;
+       }
++      mtx_unlock(&ctx->sync_worker.mutex);
+
+-      list_del(&sync->head);
+-      npt_queue_sync_retire(queue, sync);
++      /* The callback may submit more work. Never invoke it while holding the
++       * context-wide queue mutex. */
++      for (unsigned i = 0; i < retire_count; i++)
++         npt_queue_sync_retire(retire_queues[i], retire_syncs[i]);
+    }
+-   mtx_unlock(&queue->sync_thread.mutex);
+
+    return 0;
+ }
+@@ -190,61 +219,53 @@ npt_queue_thread(void *arg)
+ /* thread init / fini                                                  */
+ /* ----------------------------------------------------------------- */
+
+-static int
+-npt_queue_sync_thread_init(struct npt_queue *queue)
++bool
++npt_queue_worker_init(struct npt_context *ctx)
+ {
+-   STATIC_ASSERT(thrd_success == 0);
+-
+-   int ret = mtx_init(&queue->sync_thread.mutex, mtx_plain);
+-   if (ret != thrd_success)
+-      return ret;
+-
+-   ret = cnd_init(&queue->sync_thread.cond);
+-   if (ret != thrd_success)
+-      goto fail_cnd_init;
+-
+-   list_inithead(&queue->sync_thread.syncs);
+-   queue->sync_thread.join = false;
+-
+-   ret = thrd_create(&queue->sync_thread.thread, npt_queue_thread, queue);
+-   if (ret != thrd_success)
+-      goto fail_thrd_create;
+-
+-   return 0;
+-
+-fail_thrd_create:
+-   cnd_destroy(&queue->sync_thread.cond);
+-fail_cnd_init:
+-   mtx_destroy(&queue->sync_thread.mutex);
+-   return ret;
++   int fds[2];
++   if (pipe(fds) != 0)
++      return false;
++   for (unsigned i = 0; i < 2; i++) {
++      int flags = fcntl(fds[i], F_GETFL);
++      if (flags >= 0)
++         fcntl(fds[i], F_SETFL, flags | O_NONBLOCK);
++      flags = fcntl(fds[i], F_GETFD);
++      if (flags >= 0)
++         fcntl(fds[i], F_SETFD, flags | FD_CLOEXEC);
++   }
++   ctx->sync_worker.wake_read_fd = fds[0];
++   ctx->sync_worker.wake_write_fd = fds[1];
++   if (mtx_init(&ctx->sync_worker.mutex, mtx_plain) != thrd_success)
++      goto fail_mutex;
++   if (thrd_create(&ctx->sync_worker.thread, npt_queue_worker_thread, ctx) !=
++       thrd_success)
++      goto fail_thread;
++   npt_log("context %u: started shared fence worker", ctx->ctx_id);
++   return true;
++fail_thread:
++   mtx_destroy(&ctx->sync_worker.mutex);
++fail_mutex:
++   close(fds[0]);
++   close(fds[1]);
++   return false;
+ }
+
+-static void
+-npt_queue_sync_thread_fini(struct npt_queue *queue)
++void
++npt_queue_worker_fini(struct npt_context *ctx)
+ {
+-   /* Signal exit and join. */
+-   mtx_lock(&queue->sync_thread.mutex);
+-   queue->sync_thread.join = true;
+-   cnd_signal(&queue->sync_thread.cond);
+-   mtx_unlock(&queue->sync_thread.mutex);
+-
+-   thrd_join(queue->sync_thread.thread, NULL);
+-
+-   /* Drain leftover syncs: free them and let the renderer treat
+-    * unretired fences as context-destroy. */
+-   unsigned leftover = 0;
+-   list_for_each_entry_safe (struct npt_queue_sync, sync,
+-                             &queue->sync_thread.syncs, head) {
+-      list_del(&sync->head);
+-      npt_queue_sync_retire(queue, sync);
+-      leftover++;
+-   }
+-   if (leftover)
+-      npt_log("queue %u: drained %u leftover sync(s) on destroy",
+-              queue->ring_idx, leftover);
+-
+-   mtx_destroy(&queue->sync_thread.mutex);
+-   cnd_destroy(&queue->sync_thread.cond);
++   mtx_lock(&ctx->sync_worker.mutex);
++   ctx->sync_worker.join = true;
++   mtx_unlock(&ctx->sync_worker.mutex);
++   const uint8_t byte = 1;
++   (void)write(ctx->sync_worker.wake_write_fd, &byte, sizeof(byte));
++   thrd_join(ctx->sync_worker.thread, NULL);
++   npt_log("context %u: fence worker stopped (pending-high=%u, "
++           "queues-high=%u)", ctx->ctx_id,
++           ctx->sync_worker.pending_high_water,
++           ctx->sync_worker.queues_high_water);
++   close(ctx->sync_worker.wake_read_fd);
++   close(ctx->sync_worker.wake_write_fd);
++   mtx_destroy(&ctx->sync_worker.mutex);
+ }
+
+ /* ----------------------------------------------------------------- */
+@@ -267,11 +288,14 @@ npt_queue_create(struct npt_context *ctx, uint32_t ring_idx)
+
+    queue->context  = ctx;
+    queue->ring_idx = ring_idx;
++   list_inithead(&queue->syncs);
+
+-   if (npt_queue_sync_thread_init(queue)) {
+-      free(queue);
+-      return NULL;
+-   }
++   uint32_t queues = 0;
++   for (uint32_t i = NPT_EVENT_RING_BASE; i < ARRAY_SIZE(ctx->sync_queues); i++)
++      queues += ctx->sync_queues[i] != NULL;
++   queues++;
++   if (queues > ctx->sync_worker.queues_high_water)
++      ctx->sync_worker.queues_high_water = queues;
+
+    return queue;
+ }
+@@ -281,6 +305,15 @@ npt_queue_destroy(struct npt_queue *queue)
+ {
+    if (!queue)
+       return;
+-   npt_queue_sync_thread_fini(queue);
++   unsigned leftover = 0;
++   list_for_each_entry_safe (struct npt_queue_sync, sync,
++                             &queue->syncs, head) {
++      list_del(&sync->head);
++      npt_queue_sync_retire(queue, sync);
++      leftover++;
++   }
++   if (leftover)
++      npt_log("queue %u: drained %u leftover sync(s) on destroy",
++              queue->ring_idx, leftover);
+    free(queue);
+ }
+diff --git a/src/neptune/npt_queue.h b/src/neptune/npt_queue.h
+index cc37921..14494e1 100644
+--- a/src/neptune/npt_queue.h
++++ b/src/neptune/npt_queue.h
+@@ -2,7 +2,7 @@
+  * Copyright 2026 Turing Software LLC
+  * SPDX-License-Identifier: MIT
+  *
+- * Per-ring sync queue.  A worker thread processes a list of
++ * Per-ring sync queue.  A per-context worker processes the lists of
+  * (sync_fd, ring_idx, fence_id) tuples and calls ctx->retire_fence
+  * on each in order.  We don't own a Vulkan queue: the GPU work is
+  * performed by the host D3D library; we wait on the sync_file fd it
+@@ -26,9 +26,8 @@ struct npt_queue_sync {
+    uint32_t ring_idx;
+    uint64_t fence_id;
+
+-   /* Bumped on each poll(sync_fd) timeout; once it crosses a
+-    * threshold the worker retires as device-lost rather than spin. */
+-   unsigned timeouts;
++   /* Absolute monotonic deadline for the device-lost bailout. */
++   uint64_t deadline_ns;
+
+    struct list_head head;
+ };
+@@ -36,18 +35,15 @@ struct npt_queue_sync {
+ struct npt_queue {
+    struct npt_context *context;
+    uint32_t ring_idx;
+-
+-   /* Submitted fences go on sync_thread.syncs.  The worker pops in
+-    * order, polls on sync_fd, and retires via ctx->retire_fence. */
+-   struct {
+-      mtx_t mutex;
+-      cnd_t cond;
+-      struct list_head syncs;
+-      thrd_t thread;
+-      bool join;
+-   } sync_thread;
++   struct list_head syncs;
+ };
+
++bool
++npt_queue_worker_init(struct npt_context *ctx);
++
++void
++npt_queue_worker_fini(struct npt_context *ctx);
++
+ struct npt_queue *
+ npt_queue_create(struct npt_context *ctx, uint32_t ring_idx);
+

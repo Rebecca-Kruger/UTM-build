@@ -219,6 +219,12 @@ download_all () {
     clone $EPOXY_REPO $EPOXY_COMMIT
     clone $VULKAN_LOADER_REPO $VULKAN_LOADER_COMMIT
     clone $VIRGLRENDERER_REPO $VIRGLRENDERER_COMMIT
+    VIRGLRENDERER_DIR="$BUILD_DIR/$(basename $VIRGLRENDERER_REPO)"
+    # Replace Neptune's per-event fence threads with one poll worker per
+    # context. Reset first so cached dependency trees remain reproducible.
+    git -C "$VIRGLRENDERER_DIR" reset --hard "$VIRGLRENDERER_COMMIT"
+    git -C "$VIRGLRENDERER_DIR" apply \
+        "$PATCHES_DIR/virglrenderer-neptune-shared-sync-worker.patch"
     clone $HYPERVISOR_REPO $HYPERVISOR_COMMIT
     clone $LIBUCONTEXT_REPO $LIBUCONTEXT_COMMIT
     clone $MESA_REPO $MESA_COMMIT
