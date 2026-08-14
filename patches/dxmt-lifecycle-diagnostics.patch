@@ -1,0 +1,161 @@
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+index 4be71ce..27abc4e 100644
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -144,6 +144,10 @@ public:
+       monitor_(wsi::getWindowMonitor(hWnd)),
+       hud(WMT::DeveloperHUDProperties::instance()) {
+
++    Logger::info(str::format("lifecycle swapchain-create ptr=",
++                             reinterpret_cast<uintptr_t>(this),
++                             " hwnd=", reinterpret_cast<uintptr_t>(hWnd)));
++
+     native_view_ = WMT::CreateMetalViewFromHWND((intptr_t)hWnd, pDevice->GetMTLDevice(), layer_weak_);
+
+     if (!native_view_) {
+@@ -218,6 +222,8 @@ public:
+   };
+
+   ~MTLD3D11SwapChain() {
++    Logger::info(str::format("lifecycle swapchain-destroy ptr=",
++                             reinterpret_cast<uintptr_t>(this)));
+     device_context_->WaitUntilGPUIdle();
+     WMT::ReleaseMetalView(native_view_);
+     native_view_ = {};
+@@ -1140,4 +1146,4 @@ CreateSwapChain(
+   return S_OK;
+ };
+
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt
+diff --git a/src/dxmt/dxmt_command_queue.cpp b/src/dxmt/dxmt_command_queue.cpp
+index 89ffc37..44daa76 100644
+--- a/src/dxmt/dxmt_command_queue.cpp
++++ b/src/dxmt/dxmt_command_queue.cpp
+@@ -20,6 +20,7 @@
+ #include "dxmt_command_queue.hpp"
+ #include "Metal.hpp"
+ #include "dxmt_statistics.hpp"
++#include "log/log.hpp"
+ #include "util_env.hpp"
+ #include "util_win32_compat.h"
+ #include <atomic>
+@@ -28,12 +29,16 @@
+
+ namespace dxmt {
+
++static std::atomic_uint64_t diagnostic_next_queue_id{1};
++static std::atomic_uint32_t diagnostic_live_queues{0};
++
+ void *
+ CommandChunk::allocate_cpu_heap(size_t size, size_t alignment) {
+   return queue->AllocateCommandData(size, alignment);
+ }
+
+ CommandQueue::CommandQueue(WMT::Device device) :
++    diagnostic_id_(diagnostic_next_queue_id.fetch_add(1)),
+     encodeThread([this]() { this->EncodingThread(); }),
+     finishThread([this]() { this->WaitForFinishThread(); }),
+     device(device),
+@@ -55,6 +60,10 @@ CommandQueue::CommandQueue(WMT::Device device) :
+     argument_encoding_ctx(*this, device, cmd_library),
+     initializer(device),
+     counter_pool(device) {
++  auto live = diagnostic_live_queues.fetch_add(1) + 1;
++  Logger::info(str::format("lifecycle queue-create id=", diagnostic_id_,
++                           " ptr=", reinterpret_cast<uintptr_t>(this),
++                           " live=", live));
+   for (unsigned i = 0; i < kCommandChunkCount; i++) {
+     auto &chunk = chunks[i];
+     chunk.queue = this;
+@@ -73,6 +82,8 @@ CommandQueue::CommandQueue(WMT::Device device) :
+ }
+
+ CommandQueue::~CommandQueue() {
++  Logger::info(str::format("lifecycle queue-destroy-begin id=", diagnostic_id_,
++                           " ptr=", reinterpret_cast<uintptr_t>(this)));
+   TRACE("Destructing command queue");
+   stopped.store(true);
+   ready_for_encode++;
+@@ -87,6 +98,9 @@ CommandQueue::~CommandQueue() {
+     chunk.reset();
+   };
+   event_listener_thread.join();
++  auto live = diagnostic_live_queues.fetch_sub(1) - 1;
++  Logger::info(str::format("lifecycle queue-destroy-end id=", diagnostic_id_,
++                           " live=", live));
+   TRACE("Destructed command queue");
+ }
+
+diff --git a/src/dxmt/dxmt_command_queue.hpp b/src/dxmt/dxmt_command_queue.hpp
+index e109af7..11a3732 100644
+--- a/src/dxmt/dxmt_command_queue.hpp
++++ b/src/dxmt/dxmt_command_queue.hpp
+@@ -172,6 +172,8 @@ private:
+   uint64_t frame_count = 0;
+   uint32_t max_latency_ = 3;
+
++  uint64_t diagnostic_id_;
++
+   dxmt::thread encodeThread;
+   dxmt::thread finishThread;
+   WMT::Device device;
+@@ -315,4 +317,4 @@ public:
+   void Retain(uint64_t seq, Allocation *allocation);
+ };
+
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt
+diff --git a/src/dxmt/dxmt_device.cpp b/src/dxmt/dxmt_device.cpp
+index dc62b1b..0215519 100644
+--- a/src/dxmt/dxmt_device.cpp
++++ b/src/dxmt/dxmt_device.cpp
+@@ -2,6 +2,7 @@
+ #include "config/config.hpp"
+ #include "dxmt_command_queue.hpp"
+ #include "Metal.hpp"
++#include "log/log.hpp"
+ #include <TargetConditionals.h>
+
+ namespace dxmt {
+@@ -26,6 +27,10 @@ public:
+   };
+
+   DeviceImpl(const DEVICE_DESC &desc) : device_(desc.device), cmd_queue_(device_) {
++    Logger::info(str::format("lifecycle device-create ptr=",
++                             reinterpret_cast<uintptr_t>(this),
++                             " metal-device=",
++                             reinterpret_cast<uintptr_t>(device_.handle)));
+     uint64_t os_major_version = 0, os_minor_version = 0;
+     int version_conf = Config::getInstance().getOption<int>("dxmt.shaderMetalVersion", 0);
+     switch (version_conf) {
+@@ -71,6 +76,11 @@ public:
+     }
+   }
+
++  ~DeviceImpl() override {
++    Logger::info(str::format("lifecycle device-destroy ptr=",
++                             reinterpret_cast<uintptr_t>(this)));
++  }
++
+ private:
+   WMT::Reference<WMT::Device> device_;
+   CommandQueue cmd_queue_;
+diff --git a/src/util/log/log.cpp b/src/util/log/log.cpp
+index 96ced95..e201272 100644
+--- a/src/util/log/log.cpp
++++ b/src/util/log/log.cpp
+@@ -86,8 +86,10 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
+           std::cerr << adjusted;
+       }
+
+-      if (m_fileStream)
++      if (m_fileStream) {
+         m_fileStream << adjusted;
++        m_fileStream.flush();
++      }
+     }
+   }
+ }

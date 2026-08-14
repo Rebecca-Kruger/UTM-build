@@ -1,0 +1,200 @@
+diff --git a/src/neptune/npt_common.c b/src/neptune/npt_common.c
+index a232fee..6ec5e6f 100644
+--- a/src/neptune/npt_common.c
++++ b/src/neptune/npt_common.c
+@@ -6,6 +6,9 @@
+ #include "npt_common.h"
+
+ #include <stdarg.h>
++#include <stdio.h>
++#include <time.h>
++#include <unistd.h>
+
+ #include "util/u_debug.h"
+
+@@ -17,6 +20,10 @@ static const struct debug_named_value npt_debug_options[] = {
+
+ uint32_t npt_debug_flags;
+ uint32_t npt_profile_period_ms;
++static mtx_t lifecycle_mutex;
++static bool lifecycle_mutex_ready;
++static FILE *lifecycle_file;
++static char lifecycle_path[1024];
+
+ DEBUG_GET_ONCE_FLAGS_OPTION(npt_debug_flags, "NPT_DEBUG", npt_debug_options, 0)
+ DEBUG_GET_ONCE_NUM_OPTION(npt_profile_period_ms_raw,
+@@ -30,6 +37,64 @@ npt_debug_init(void)
+    /* Clamp to a sane range so a huge value can't suppress dumps. */
+    long v = debug_get_option_npt_profile_period_ms_raw();
+    npt_profile_period_ms = (v > 0 && v < 60000) ? (uint32_t)v : 1000u;
++
++   const char *path = getenv("NPT_LIFECYCLE_LOG_PATH");
++   if (path && *path && strlen(path) < sizeof(lifecycle_path)) {
++      memcpy(lifecycle_path, path, strlen(path) + 1);
++      char previous[sizeof(lifecycle_path) + 16];
++      snprintf(previous, sizeof(previous), "%s.previous", lifecycle_path);
++      unlink(previous);
++      rename(lifecycle_path, previous);
++      lifecycle_mutex_ready =
++         mtx_init(&lifecycle_mutex, mtx_plain) == thrd_success;
++   }
++}
++
++static void
++npt_lifecycle_open(void)
++{
++   if (lifecycle_file || !lifecycle_path[0])
++      return;
++   lifecycle_file = fopen(lifecycle_path, "a");
++   if (lifecycle_file)
++      setvbuf(lifecycle_file, NULL, _IOLBF, 0);
++}
++
++void
++npt_lifecycle_log(const char *fmt, ...)
++{
++   if (!lifecycle_mutex_ready)
++      return;
++   mtx_lock(&lifecycle_mutex);
++   npt_lifecycle_open();
++   if (!lifecycle_file) {
++      mtx_unlock(&lifecycle_mutex);
++      return;
++   }
++
++   long pos = ftell(lifecycle_file);
++   if (pos >= 16 * 1024 * 1024) {
++      fclose(lifecycle_file);
++      lifecycle_file = NULL;
++      char previous[sizeof(lifecycle_path) + 16];
++      snprintf(previous, sizeof(previous), "%s.previous", lifecycle_path);
++      unlink(previous);
++      rename(lifecycle_path, previous);
++      npt_lifecycle_open();
++   }
++
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   fprintf(lifecycle_file, "%lld.%06ld pid=%d tid=%p ",
++           (long long)ts.tv_sec, ts.tv_nsec / 1000, getpid(),
++           (void *)(uintptr_t)thrd_current());
++   va_list va;
++   va_start(va, fmt);
++   vfprintf(lifecycle_file, fmt, va);
++   va_end(va);
++   fputc('\n', lifecycle_file);
++   fflush(lifecycle_file);
++   mtx_unlock(&lifecycle_mutex);
+ }
+
+ void
+diff --git a/src/neptune/npt_common.h b/src/neptune/npt_common.h
+index c03b5c4..d1aa86b 100644
+--- a/src/neptune/npt_common.h
++++ b/src/neptune/npt_common.h
+@@ -79,6 +79,9 @@ npt_debug_init(void);
+ void
+ npt_log(const char *fmt, ...);
+
++void
++npt_lifecycle_log(const char *fmt, ...);
++
+ static inline bool
+ npt_region_is_valid(const struct npt_region *region)
+ {
+diff --git a/src/neptune/npt_context.c b/src/neptune/npt_context.c
+index fa6c750..16897ca 100644
+--- a/src/neptune/npt_context.c
++++ b/src/neptune/npt_context.c
+@@ -418,6 +418,8 @@ npt_context_create(uint32_t ctx_id,
+
+    npt_log("created Neptune context %u (%.*s)", ctx_id, (int)debug_len,
+            debug_name ? debug_name : "");
++   npt_lifecycle_log("context-create ctx=%u name=%.*s", ctx_id,
++                     (int)debug_len, debug_name ? debug_name : "");
+
+    return ctx;
+
+@@ -456,6 +458,7 @@ void
+ npt_context_destroy(struct npt_context *ctx)
+ {
+    npt_log("destroying Neptune context %u", ctx->ctx_id);
++   npt_lifecycle_log("context-destroy-begin ctx=%u", ctx->ctx_id);
+
+    /* Stop the ring monitor before the rings so it can't touch a ring
+     * mid-teardown. */
+@@ -513,6 +516,7 @@ npt_context_destroy(struct npt_context *ctx)
+    mtx_destroy(&ctx->ring_mutex);
+
+    free(ctx->debug_name);
++   npt_lifecycle_log("context-destroy-end ctx=%u", ctx->ctx_id);
+    free(ctx);
+ }
+
+diff --git a/src/neptune/npt_event.c b/src/neptune/npt_event.c
+index 62a6ae7..ed7dafd 100644
+--- a/src/neptune/npt_event.c
++++ b/src/neptune/npt_event.c
+@@ -263,6 +263,9 @@ npt_event_register(struct npt_context *ctx, uint64_t token)
+       return;
+    }
+    event_proxy_create_locked(ctx, token, /*initial_refcount=*/1);
++   npt_lifecycle_log("event-register ctx=%u token=0x%016" PRIx64
++                     " proxies=%u", ctx->ctx_id, token,
++                     _mesa_hash_table_num_entries(ctx->event_proxies));
+    mtx_unlock(&ctx->event_mutex);
+ }
+
+@@ -349,6 +352,9 @@ npt_event_release(struct npt_context *ctx, uint64_t token)
+       return;
+    }
+    npt_event_proxy_unref_locked(ctx, e->data, e);
++   npt_lifecycle_log("event-release ctx=%u token=0x%016" PRIx64
++                     " proxies=%u", ctx->ctx_id, token,
++                     _mesa_hash_table_num_entries(ctx->event_proxies));
+    mtx_unlock(&ctx->event_mutex);
+ }
+
+diff --git a/src/neptune/npt_queue.c b/src/neptune/npt_queue.c
+index f6d518a..4785f61 100644
+--- a/src/neptune/npt_queue.c
++++ b/src/neptune/npt_queue.c
+@@ -268,6 +268,8 @@ npt_queue_create(struct npt_context *ctx, uint32_t ring_idx)
+    queue->context  = ctx;
+    queue->ring_idx = ring_idx;
+
++   npt_lifecycle_log("queue-create ctx=%u ring=%u", ctx->ctx_id, ring_idx);
++
+    if (npt_queue_sync_thread_init(queue)) {
+       free(queue);
+       return NULL;
+@@ -281,6 +283,8 @@ npt_queue_destroy(struct npt_queue *queue)
+ {
+    if (!queue)
+       return;
++   npt_lifecycle_log("queue-destroy ctx=%u ring=%u", queue->context->ctx_id,
++                     queue->ring_idx);
+    npt_queue_sync_thread_fini(queue);
+    free(queue);
+ }
+diff --git a/src/neptune/npt_shared.c b/src/neptune/npt_shared.c
+index 907d503..0607539 100644
+--- a/src/neptune/npt_shared.c
++++ b/src/neptune/npt_shared.c
+@@ -232,6 +232,8 @@ npt_shared_export_blob(struct npt_context *ctx, uint64_t texture_id,
+            desc->meta.Height, desc->meta.Format, desc->drmFormatModifier,
+            desc->planes[0].pitch, ctx->ctx_id);
+ #endif
++   npt_lifecycle_log("shared-export ctx=%u blob=%" PRIu64
++                     " size=%" PRIu64, ctx->ctx_id, blob_id, export_size);
+    return NPT_S_OK;
+ }
+
+@@ -343,5 +345,7 @@ npt_shared_open_res(struct npt_context *ctx, uint64_t device_id,
+
+    npt_log("shared: opened res_id=%u -> id 0x%016" PRIx64 " (ctx %u)",
+            cmd->res_id, cmd->mint_object_id, ctx->ctx_id);
++   npt_lifecycle_log("shared-open ctx=%u res=%u object=0x%016" PRIx64,
++                     ctx->ctx_id, cmd->res_id, cmd->mint_object_id);
+    return NPT_S_OK;
+ }

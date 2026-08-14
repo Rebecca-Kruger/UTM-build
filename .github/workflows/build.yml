@@ -234,6 +234,10 @@ jobs:
           test -d UTM.xcarchive
           test -d UTM.xcarchive/Products/Applications/UTM.app
 
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleIdentifier com.utmapp.UTMdxdiag" \
+            UTM.xcarchive/Products/Applications/UTM.app/Info.plist
+
           echo "Archive created:"
           du -sh UTM.xcarchive
 
@@ -296,6 +300,9 @@ jobs:
             -c "Print :CFBundleIdentifier" \
             "$APP_PATH/Info.plist"
 
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+            "$APP_PATH/Info.plist")" = "com.utmapp.UTMdxdiag"
+
           /usr/libexec/PlistBuddy \
             -c "Print :MinimumOSVersion" \
             "$APP_PATH/Info.plist"
@@ -326,7 +333,7 @@ jobs:
       - name: Upload UTM-HV IPA
         uses: actions/upload-artifact@v4
         with:
-          name: UTM-HV-iPadOS-16.3-arm64
+          name: UTM-HV-GPU-Diagnostics-iPadOS-16.3-arm64
           path: UTM-HV.ipa
           if-no-files-found: error
           compression-level: 0
