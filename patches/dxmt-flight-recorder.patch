@@ -1,0 +1,923 @@
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+index 4be71ce..17aec4f 100644
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -215,9 +215,14 @@ public:
+     ResizeBuffers(0, desc_.Width, desc_.Height, DXGI_FORMAT_UNKNOWN, desc_.Flags);
+     if (!fullscreen_desc_.Windowed)
+       EnterFullscreenMode(nullptr);
++    Logger::info(str::format("lifecycle swapchain-create ptr=",
++                             reinterpret_cast<uintptr_t>(this),
++                             " hwnd=", reinterpret_cast<uintptr_t>(hWnd)));
+   };
+ 
+   ~MTLD3D11SwapChain() {
++    Logger::info(str::format("lifecycle swapchain-destroy-begin ptr=",
++                             reinterpret_cast<uintptr_t>(this)));
+     device_context_->WaitUntilGPUIdle();
+     WMT::ReleaseMetalView(native_view_);
+     native_view_ = {};
+@@ -1140,4 +1145,4 @@ CreateSwapChain(
+   return S_OK;
+ };
+ 
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt
+diff --git a/src/dxmt/dxmt_command_queue.cpp b/src/dxmt/dxmt_command_queue.cpp
+index 89ffc37..ac35c0b 100644
+--- a/src/dxmt/dxmt_command_queue.cpp
++++ b/src/dxmt/dxmt_command_queue.cpp
+@@ -20,20 +20,32 @@
+ #include "dxmt_command_queue.hpp"
+ #include "Metal.hpp"
+ #include "dxmt_statistics.hpp"
++#include "log/log.hpp"
+ #include "util_env.hpp"
+ #include "util_win32_compat.h"
+ #include <atomic>
++#include <chrono>
++#include <thread>
++#ifndef _WIN32
++#include <unistd.h>
++#endif
+ 
+ #define ASYNC_ENCODING 1
+ 
+ namespace dxmt {
+ 
++static std::atomic_uint64_t diagnostic_next_queue_id{1};
++static std::atomic_uint32_t diagnostic_live_queues{0};
++static std::atomic_uint64_t diagnostic_next_submission_id{1};
++static std::atomic_uint32_t diagnostic_global_inflight{0};
++
+ void *
+ CommandChunk::allocate_cpu_heap(size_t size, size_t alignment) {
+   return queue->AllocateCommandData(size, alignment);
+ }
+ 
+ CommandQueue::CommandQueue(WMT::Device device) :
++    diagnostic_id_(diagnostic_next_queue_id.fetch_add(1)),
+     encodeThread([this]() { this->EncodingThread(); }),
+     finishThread([this]() { this->WaitForFinishThread(); }),
+     device(device),
+@@ -70,9 +82,31 @@ CommandQueue::CommandQueue(WMT::Device device) :
+     } catch (const std::invalid_argument &) {
+     }
+   }
++  auto live = diagnostic_live_queues.fetch_add(1) + 1;
++  auto diagnostic_path = env::getEnvVar("DXMT_LOG_PATH");
++  if (!diagnostic_path.empty() && diagnostic_path != "none") {
++    if (*diagnostic_path.rbegin() != '/')
++      diagnostic_path += '/';
++    const auto diagnostic_base = diagnostic_path + env::getExeBaseName() +
++                                 "_dxmt_queue_" +
++                                 std::to_string(diagnostic_id_);
++    diagnostic_submit_stream_ = std::ofstream(
++        str::topath((diagnostic_base + ".submit.flight.log").c_str()).c_str(),
++        std::ios::out | std::ios::app);
++    diagnostic_completion_stream_ = std::ofstream(
++        str::topath((diagnostic_base + ".complete.flight.log").c_str()).c_str(),
++        std::ios::out | std::ios::app);
++  }
++  Logger::info(str::format("lifecycle queue-create id=", diagnostic_id_,
++                           " ptr=", reinterpret_cast<uintptr_t>(this),
++                           " metal-device=", static_cast<uint64_t>(device.handle),
++                           " metal-queue=", static_cast<uint64_t>(commandQueue.handle),
++                           " live=", live));
+ }
+ 
+ CommandQueue::~CommandQueue() {
++  Logger::info(str::format("lifecycle queue-destroy-begin id=", diagnostic_id_,
++                           " ptr=", reinterpret_cast<uintptr_t>(this)));
+   TRACE("Destructing command queue");
+   stopped.store(true);
+   ready_for_encode++;
+@@ -87,9 +121,46 @@ CommandQueue::~CommandQueue() {
+     chunk.reset();
+   };
+   event_listener_thread.join();
++  auto live = diagnostic_live_queues.fetch_sub(1) - 1;
++  Logger::info(str::format("lifecycle queue-destroy-end id=", diagnostic_id_,
++                           " live=", live));
+   TRACE("Destructed command queue");
+ }
+ 
++void
++CommandQueue::DiagnosticLogSubmit(const std::string &message) {
++  if (!diagnostic_submit_stream_)
++    return;
++  const auto timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
++      std::chrono::steady_clock::now().time_since_epoch()).count();
++  diagnostic_submit_stream_ << timestamp << " pid="
++#ifdef _WIN32
++                            << GetCurrentProcessId()
++#else
++                            << getpid()
++#endif
++                            << " tid=" << std::this_thread::get_id() << " "
++                            << message << std::endl;
++  diagnostic_submit_stream_.flush();
++}
++
++void
++CommandQueue::DiagnosticLogCompletion(const std::string &message) {
++  if (!diagnostic_completion_stream_)
++    return;
++  const auto timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
++      std::chrono::steady_clock::now().time_since_epoch()).count();
++  diagnostic_completion_stream_ << timestamp << " pid="
++#ifdef _WIN32
++                                << GetCurrentProcessId()
++#else
++                                << getpid()
++#endif
++                                << " tid=" << std::this_thread::get_id() << " "
++                                << message << std::endl;
++  diagnostic_completion_stream_.flush();
++}
++
+ void
+ CommandQueue::CommitCurrentChunk() {
+   auto chunk_id = ready_for_encode.load(std::memory_order_relaxed);
+@@ -158,6 +229,32 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk, uint64_t seq) {
+     cmdbuf.encodeWaitForEvent(initializer.event(), chunk.resource_initializer_event_id);
+   }
+   chunk.encode(chunk.attached_cmdbuf, this->argument_encoding_ctx);
++  chunk.flight_submission_id = diagnostic_next_submission_id.fetch_add(1);
++  const auto queue_inflight = diagnostic_inflight_.fetch_add(1) + 1;
++  const auto global_inflight = diagnostic_global_inflight.fetch_add(1) + 1;
++  const auto &flight = chunk.flight_summary;
++  DiagnosticLogSubmit(str::format(
++      "flight submit id=", chunk.flight_submission_id,
++      " queue=", diagnostic_id_, " seq=", seq, " chunk=", chunk.chunk_id,
++      " frame=", chunk.frame_, " event=", chunk.chunk_event_id,
++      " cmdbuf=", static_cast<uint64_t>(cmdbuf.handle),
++      " qinflight=", queue_inflight, " ginflight=", global_inflight,
++      " enc=", flight.encoder_count, " mask=", flight.encoder_mask,
++      " render=", flight.render_count, " compute=", flight.compute_count,
++      " blit=", flight.blit_count, " present=", flight.present_count,
++      " commands=", flight.command_count, " draws=", flight.draw_count,
++      " dispatches=", flight.dispatch_count, " copies=", flight.copy_count,
++      " rt=", flight.render_target_width, "x", flight.render_target_height,
++      " rflags=", flight.render_flags,
++      " cmdhash=", flight.command_hash,
++      " psohash=", flight.pipeline_hash,
++      " lastpso=", flight.last_pipeline,
++      " psobinds=", flight.pipeline_bind_count,
++      " reshash=", flight.resource_hash,
++      " lastres=", flight.last_resource,
++      " resbinds=", flight.resource_bind_count,
++      " lastcmd=", flight.last_command,
++      " fmthash=", flight.attachment_format_hash));
+   cmdbuf.commit();
+ 
+   ready_for_commit.fetch_add(1, std::memory_order_release);
+@@ -199,6 +296,10 @@ CommandQueue::WaitForFinishThread() {
+     }
+     if (chunk.attached_cmdbuf.status() == WMTCommandBufferStatusError) {
+       ERR("Device error at frame ", chunk.frame_, ": ", chunk.attached_cmdbuf.error().description().getUTF8String());
++      DiagnosticLogCompletion(str::format(
++          "flight complete-error id=", chunk.flight_submission_id,
++          " queue=", diagnostic_id_, " seq=", internal_seq,
++          " status=", chunk.attached_cmdbuf.status()));
+     }
+     if (auto logs = chunk.attached_cmdbuf.logs()) {
+       for (auto &log : logs.elements()) {
+@@ -209,6 +310,19 @@ CommandQueue::WaitForFinishThread() {
+     if (chunk.signal_frame_latency_fence_ != ~0ull)
+       frame_latency_fence_.signal(chunk.signal_frame_latency_fence_);
+ 
++    const auto completed_id = chunk.flight_submission_id;
++    const auto completion_status = chunk.attached_cmdbuf.status();
++    diagnostic_last_completed_.store(completed_id, std::memory_order_relaxed);
++    const auto queue_inflight = diagnostic_inflight_.fetch_sub(1) - 1;
++    const auto global_inflight = diagnostic_global_inflight.fetch_sub(1) - 1;
++    if ((internal_seq & 15u) == 0) {
++      DiagnosticLogCompletion(str::format(
++          "flight complete-checkpoint id=", completed_id,
++          " queue=", diagnostic_id_, " seq=", internal_seq,
++          " status=", completion_status, " qinflight=", queue_inflight,
++          " ginflight=", global_inflight));
++    }
++
+     chunk.reset();
+     cpu_coherent.signal(internal_seq);
+     chunk_ongoing.fetch_sub(1, std::memory_order_release);
+diff --git a/src/dxmt/dxmt_command_queue.hpp b/src/dxmt/dxmt_command_queue.hpp
+index e109af7..5d05875 100644
+--- a/src/dxmt/dxmt_command_queue.hpp
++++ b/src/dxmt/dxmt_command_queue.hpp
+@@ -37,6 +37,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstdlib>
++#include <fstream>
+ #include <span>
+ 
+ namespace dxmt {
+@@ -116,7 +117,8 @@ public:
+     list_enc.execute(enc);
+     attached_cmdbuf = cmdbuf;
+     auto t1 = clock::now();
+-    readback = enc.flushCommands(cmdbuf, chunk_id, chunk_event_id);
++    readback = enc.flushCommands(cmdbuf, chunk_id, chunk_event_id,
++                                 &flight_summary);
+     auto t2 = clock::now();
+     statistics.encode_prepare_interval += (t1 - t0);
+     statistics.encode_flush_interval += (t2 - t1);
+@@ -128,6 +130,8 @@ public:
+   uint64_t signal_frame_latency_fence_;
+   QueryReadbacks readback;
+   uint64_t resource_initializer_event_id;
++  uint64_t flight_submission_id;
++  FlightRecorderSummary flight_summary;
+ 
+ private:
+   CommandQueue *queue;
+@@ -144,6 +148,8 @@ public:
+   void
+   reset() noexcept {
+     signal_frame_latency_fence_ = ~0ull;
++    flight_submission_id = 0;
++    flight_summary = {};
+     readback = {};
+     list_enc.reset();
+     ref_tracker.clear();
+@@ -172,6 +178,15 @@ private:
+   uint64_t frame_count = 0;
+   uint32_t max_latency_ = 3;
+ 
++  uint64_t diagnostic_id_;
++  std::atomic_uint32_t diagnostic_inflight_{0};
++  std::atomic_uint64_t diagnostic_last_completed_{0};
++  std::ofstream diagnostic_submit_stream_;
++  std::ofstream diagnostic_completion_stream_;
++
++  void DiagnosticLogSubmit(const std::string &message);
++  void DiagnosticLogCompletion(const std::string &message);
++
+   dxmt::thread encodeThread;
+   dxmt::thread finishThread;
+   WMT::Device device;
+@@ -315,4 +330,4 @@ public:
+   void Retain(uint64_t seq, Allocation *allocation);
+ };
+ 
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt
+diff --git a/src/dxmt/dxmt_context.cpp b/src/dxmt/dxmt_context.cpp
+index 5445501..31a9822 100644
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -24,6 +24,7 @@
+ #include "dxmt_occlusion_query.hpp"
+ #include "dxmt_presenter.hpp"
+ #include "wsi_platform.hpp"
++#include <algorithm>
+ #include <cstdint>
+ #include <cfloat>
+ 
+@@ -859,8 +860,188 @@ ArgumentEncodingContext::$$setEncodingContext(uint64_t seq_id, uint64_t frame_id
+ 
+ constexpr unsigned kEncoderOptimizerThreshold = 64;
+ 
++static inline void
++flight_hash(uint64_t &hash, uint64_t value) {
++  hash ^= value;
++  hash *= 1099511628211ull;
++}
++
++static void
++flight_hash_commands(wmtcmd_base *command, EncoderType encoder_type,
++                     FlightRecorderSummary &summary) {
++  /* The same lists are consumed immediately below by winemetal.  Walking them
++   * is observational only; the cap protects diagnostics from a corrupt cycle. */
++  for (uint32_t count = 0; command && count < 100000; count++) {
++    const uint16_t type = command->type;
++    summary.command_count++;
++    summary.last_command =
++        (static_cast<uint64_t>(encoder_type) << 32) | type;
++    flight_hash(summary.command_hash,
++                (static_cast<uint64_t>(encoder_type) << 32) | type);
++
++    if (encoder_type == EncoderType::Render) {
++      if ((type >= WMTRenderCommandDraw &&
++           type <= WMTRenderCommandDrawMeshThreadgroupsIndirect) ||
++          (type >= WMTRenderCommandDXMTGeometryDraw &&
++           type <= WMTRenderCommandDXMTGeometryDrawIndexedIndirect) ||
++          (type >= WMTRenderCommandDXMTTessellationMeshDraw &&
++           type <= WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect))
++        summary.draw_count++;
++      if (type == WMTRenderCommandSetPSO) {
++        auto pso = reinterpret_cast<wmtcmd_render_setpso *>(command)->pso;
++        summary.last_pipeline = static_cast<uint64_t>(pso);
++        summary.pipeline_bind_count++;
++        flight_hash(summary.pipeline_hash, static_cast<uint64_t>(pso));
++      } else if (type == WMTRenderCommandUseResource) {
++        auto resource = reinterpret_cast<wmtcmd_render_useresource *>(command)->resource;
++        summary.last_resource = static_cast<uint64_t>(resource);
++        summary.resource_bind_count++;
++        flight_hash(summary.resource_hash, static_cast<uint64_t>(resource));
++      } else if (type == WMTRenderCommandSetFragmentTexture) {
++        auto texture = reinterpret_cast<wmtcmd_render_settexture *>(command)->texture;
++        summary.last_resource = static_cast<uint64_t>(texture);
++        summary.resource_bind_count++;
++        flight_hash(summary.resource_hash, static_cast<uint64_t>(texture));
++      }
++    } else if (encoder_type == EncoderType::Compute) {
++      if (type == WMTComputeCommandDispatch ||
++          type == WMTComputeCommandDispatchIndirect ||
++          type == WMTComputeCommandDispatchThreads)
++        summary.dispatch_count++;
++      if (type == WMTComputeCommandSetPSO) {
++        auto pso = reinterpret_cast<wmtcmd_compute_setpso *>(command)->pso;
++        summary.last_pipeline = static_cast<uint64_t>(pso);
++        summary.pipeline_bind_count++;
++        flight_hash(summary.pipeline_hash, static_cast<uint64_t>(pso));
++      } else if (type == WMTComputeCommandUseResource) {
++        auto resource = reinterpret_cast<wmtcmd_compute_useresource *>(command)->resource;
++        summary.last_resource = static_cast<uint64_t>(resource);
++        summary.resource_bind_count++;
++        flight_hash(summary.resource_hash, static_cast<uint64_t>(resource));
++      } else if (type == WMTComputeCommandSetTexture) {
++        auto texture = reinterpret_cast<wmtcmd_compute_settexture *>(command)->texture;
++        summary.last_resource = static_cast<uint64_t>(texture);
++        summary.resource_bind_count++;
++        flight_hash(summary.resource_hash, static_cast<uint64_t>(texture));
++      }
++    } else if (encoder_type == EncoderType::Blit) {
++      if ((type >= WMTBlitCommandCopyFromBufferToBuffer &&
++           type <= WMTBlitCommandGenerateMipmaps) ||
++          type == WMTBlitCommandCopyFromBufferToTextureWithBlitOption)
++        summary.copy_count++;
++    }
++    command = reinterpret_cast<wmtcmd_base *>(command->next.get());
++  }
++}
++
++static void
++flight_summarize(EncoderData **encoders, unsigned encoder_count,
++                 FlightRecorderSummary &summary) {
++  summary.encoder_count = encoder_count;
++  for (unsigned i = 0; i < encoder_count; i++) {
++    EncoderData *current = encoders[i];
++    const auto type = static_cast<unsigned>(current->type);
++    if (type < 64)
++      summary.encoder_mask |= 1ull << type;
++
++    switch (current->type) {
++    case EncoderType::Render: {
++      auto data = static_cast<RenderEncoderData *>(current);
++      summary.render_count++;
++      summary.render_target_width =
++          std::max(summary.render_target_width, data->render_target_width);
++      summary.render_target_height =
++          std::max(summary.render_target_height, data->render_target_height);
++      summary.render_flags |= data->use_visibility_result ? 1u : 0u;
++      summary.render_flags |= data->use_tessellation ? 2u : 0u;
++      summary.render_flags |= data->use_geometry ? 4u : 0u;
++      summary.render_flags |= data->use_emulated_so ? 8u : 0u;
++      summary.render_flags |= data->pipeline_invalid ? 16u : 0u;
++      flight_hash(summary.pipeline_hash,
++                  static_cast<uint64_t>(data->last_pso.handle));
++      if (data->last_pso)
++        summary.last_pipeline = static_cast<uint64_t>(data->last_pso.handle);
++      for (auto &color : data->colors) {
++        auto color_texture = color.attachment.texture();
++        auto resolve_texture = color.resolve_attachment.texture();
++        flight_hash(summary.resource_hash,
++                    static_cast<uint64_t>(color_texture.handle));
++        flight_hash(summary.resource_hash,
++                    static_cast<uint64_t>(resolve_texture.handle));
++        if (color_texture)
++          flight_hash(summary.attachment_format_hash,
++                      static_cast<uint64_t>(color_texture.pixelFormat()));
++        if (resolve_texture)
++          flight_hash(summary.attachment_format_hash,
++                      static_cast<uint64_t>(resolve_texture.pixelFormat()));
++      }
++      auto depth_texture = data->depth.attachment.texture();
++      auto stencil_texture = data->stencil.attachment.texture();
++      flight_hash(summary.resource_hash, static_cast<uint64_t>(depth_texture.handle));
++      flight_hash(summary.resource_hash, static_cast<uint64_t>(stencil_texture.handle));
++      if (depth_texture)
++        flight_hash(summary.attachment_format_hash,
++                    static_cast<uint64_t>(depth_texture.pixelFormat()));
++      if (stencil_texture)
++        flight_hash(summary.attachment_format_hash,
++                    static_cast<uint64_t>(stencil_texture.pixelFormat()));
++      flight_hash_commands(reinterpret_cast<wmtcmd_base *>(data->cmd_head.next.get()),
++                           current->type, summary);
++      break;
++    }
++    case EncoderType::Compute: {
++      auto data = static_cast<ComputeEncoderData *>(current);
++      summary.compute_count++;
++      flight_hash_commands(reinterpret_cast<wmtcmd_base *>(data->cmd_head.next.get()),
++                           current->type, summary);
++      break;
++    }
++    case EncoderType::Blit: {
++      auto data = static_cast<BlitEncoderData *>(current);
++      summary.blit_count++;
++      flight_hash_commands(reinterpret_cast<wmtcmd_base *>(data->cmd_head.next.get()),
++                           current->type, summary);
++      break;
++    }
++    case EncoderType::Present: {
++      auto data = static_cast<PresentData *>(current);
++      summary.present_count++;
++      flight_hash(summary.resource_hash,
++                  static_cast<uint64_t>(data->backbuffer.handle));
++      break;
++    }
++    case EncoderType::Clear: {
++      auto data = static_cast<ClearEncoderData *>(current);
++      flight_hash(summary.resource_hash,
++                  static_cast<uint64_t>(data->attachment.texture().handle));
++      break;
++    }
++    case EncoderType::Resolve: {
++      auto data = static_cast<ResolveEncoderData *>(current);
++      flight_hash(summary.resource_hash,
++                  static_cast<uint64_t>(data->src.texture().handle));
++      flight_hash(summary.resource_hash,
++                  static_cast<uint64_t>(data->dst.texture().handle));
++      break;
++    }
++    case EncoderType::SpatialUpscale: {
++      auto data = static_cast<SpatialUpscaleData *>(current);
++      flight_hash(summary.resource_hash,
++                  static_cast<uint64_t>(data->backbuffer.handle));
++      flight_hash(summary.resource_hash,
++                  static_cast<uint64_t>(data->upscaled.handle));
++      break;
++    }
++    default:
++      break;
++    }
++  }
++}
++
+ QueryReadbacks
+-ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId, uint64_t event_seq_id) {
++ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId,
++                                       uint64_t event_seq_id,
++                                       FlightRecorderSummary *flight_summary) {
+   assert(!encoder_current);
+ 
+   unsigned encoder_count = encoder_count_;
+@@ -893,6 +1074,9 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
+     }
+   }
+ 
++  if (flight_summary)
++    flight_summarize(encoders, encoder_count, *flight_summary);
++
+   QueryReadbacks readbacks{};
+ 
+   if (auto count = vro_state_.reset()) {
+@@ -1590,4 +1774,4 @@ ArgumentEncodingContext::isResolveSignatureMatched(RenderEncoderData *render, Re
+   return ret;
+ }
+ 
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt
+diff --git a/src/dxmt/dxmt_context.hpp b/src/dxmt/dxmt_context.hpp
+index c1f6f6c..c9487bf 100644
+--- a/src/dxmt/dxmt_context.hpp
++++ b/src/dxmt/dxmt_context.hpp
+@@ -120,6 +120,34 @@ enum class EncoderType {
+   SampleTimestamp,
+ };
+ 
++/* Compact, read-only description of one Metal command buffer.  The flight
++ * recorder deliberately stores hashes and counters instead of emitting a log
++ * line per encoder/command, which would materially perturb queue timing. */
++struct FlightRecorderSummary {
++  uint64_t encoder_mask = 0;
++  uint64_t command_hash = 1469598103934665603ull;
++  uint64_t pipeline_hash = 1469598103934665603ull;
++  uint64_t resource_hash = 1469598103934665603ull;
++  uint64_t attachment_format_hash = 1469598103934665603ull;
++  uint64_t last_pipeline = 0;
++  uint64_t last_resource = 0;
++  uint64_t last_command = 0;
++  uint32_t encoder_count = 0;
++  uint32_t render_count = 0;
++  uint32_t compute_count = 0;
++  uint32_t blit_count = 0;
++  uint32_t present_count = 0;
++  uint32_t command_count = 0;
++  uint32_t draw_count = 0;
++  uint32_t dispatch_count = 0;
++  uint32_t copy_count = 0;
++  uint32_t pipeline_bind_count = 0;
++  uint32_t resource_bind_count = 0;
++  uint32_t render_target_width = 0;
++  uint32_t render_target_height = 0;
++  uint32_t render_flags = 0;
++};
++
+ struct EncoderData {
+   EncoderType type;
+   EncoderData *next = nullptr;
+@@ -802,7 +830,9 @@ public:
+   
+   AllocatedTempBufferSlice allocateTempBuffer1(size_t size, size_t alignment);
+ 
+-  QueryReadbacks flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId, uint64_t event_seq_id);
++  QueryReadbacks flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId,
++                               uint64_t event_seq_id,
++                               FlightRecorderSummary *flight_summary);
+ 
+   uint64_t currentSeqId() {return seq_id_;}
+ 
+@@ -1041,4 +1071,4 @@ ArgumentEncodingContext::track<PipelineStage::Pixel>(GenericAccessTracker &track
+   return;
+ }
+ 
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt
+diff --git a/src/dxmt/dxmt_device.cpp b/src/dxmt/dxmt_device.cpp
+index dc62b1b..bac56a0 100644
+--- a/src/dxmt/dxmt_device.cpp
++++ b/src/dxmt/dxmt_device.cpp
+@@ -2,6 +2,7 @@
+ #include "config/config.hpp"
+ #include "dxmt_command_queue.hpp"
+ #include "Metal.hpp"
++#include "log/log.hpp"
+ #include <TargetConditionals.h>
+ 
+ namespace dxmt {
+@@ -69,6 +70,15 @@ public:
+       max_object_threadgroups_ = -1ull;
+       device_.setShouldMaximizeConcurrentCompilation(true);
+     }
++    Logger::info(str::format("lifecycle device-create ptr=",
++                             reinterpret_cast<uintptr_t>(this),
++                             " metal-device=",
++                             static_cast<uint64_t>(device_.handle)));
++  }
++
++  ~DeviceImpl() override {
++    Logger::info(str::format("lifecycle device-destroy-begin ptr=",
++                             reinterpret_cast<uintptr_t>(this)));
+   }
+ 
+ private:
+diff --git a/src/dxmt/dxmt_presenter.cpp b/src/dxmt/dxmt_presenter.cpp
+index 86c9d72..a1e5abd 100644
+--- a/src/dxmt/dxmt_presenter.cpp
++++ b/src/dxmt/dxmt_presenter.cpp
+@@ -3,6 +3,7 @@
+ #include "Metal.hpp"
+ #include "dxmt_format.hpp"
+ #include "dxmt_presenter.hpp"
++#include "log/log.hpp"
+ #include "util_likely.hpp"
+ 
+ 
+@@ -110,6 +111,10 @@ Presenter::synchronizeLayerProperties() {
+   );
+ 
+   if (display_setting_version != display_setting_version_) {
++    Logger::debug(str::format("lifecycle display-settings old=",
++                              display_setting_version_, " new=",
++                              display_setting_version, " layer=",
++                              static_cast<uint64_t>(layer_.handle)));
+     display_setting_version_ = display_setting_version;
+     pso_valid.clear();
+   }
+@@ -234,4 +239,4 @@ Presenter::buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_
+   }
+ }
+ 
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt
+diff --git a/src/util/log/log.cpp b/src/util/log/log.cpp
+index 96ced95..6a56901 100644
+--- a/src/util/log/log.cpp
++++ b/src/util/log/log.cpp
+@@ -9,15 +9,135 @@
+  */
+ 
+ #include <iostream>
++#include <chrono>
++#include <thread>
+ #include <utility>
++#ifndef _WIN32
++#include <unistd.h>
++#endif
+ 
+ #include "log.hpp"
+ 
++#include "Metal.hpp"
+ #include "../util_env.hpp"
+ #include "util_string.hpp"
+ 
+ namespace dxmt {
+ 
++static uint64_t
++flightPipelineColorHash(const WMTColorAttachmentBlendInfo *colors) {
++  uint64_t hash = 1469598103934665603ull;
++  for (unsigned i = 0; i < 8; i++) {
++    hash ^= static_cast<uint64_t>(colors[i].pixel_format);
++    hash *= 1099511628211ull;
++    hash ^= static_cast<uint64_t>(colors[i].write_mask) |
++            (static_cast<uint64_t>(colors[i].blending_enabled) << 8) |
++            (static_cast<uint64_t>(colors[i].rgb_blend_operation) << 16) |
++            (static_cast<uint64_t>(colors[i].alpha_blend_operation) << 24);
++    hash *= 1099511628211ull;
++  }
++  return hash;
++}
++
++void
++flightRecorderPipeline(obj_handle_t device,
++                       const WMTComputePipelineInfo &info,
++                       obj_handle_t pipeline) {
++  Logger::debug(str::format(
++      "flight pipeline-create kind=compute device=", static_cast<uint64_t>(device),
++      " pso=", static_cast<uint64_t>(pipeline),
++      " function=", static_cast<uint64_t>(info.compute_function),
++      " tg-multiple=", info.tgsize_is_multiple_of_sgwidth,
++      " immutable=", info.immutable_buffers));
++}
++
++void
++flightRecorderPipeline(obj_handle_t device,
++                       const WMTRenderPipelineInfo &info,
++                       obj_handle_t pipeline) {
++  Logger::debug(str::format(
++      "flight pipeline-create kind=render device=", static_cast<uint64_t>(device),
++      " pso=", static_cast<uint64_t>(pipeline),
++      " vertex=", static_cast<uint64_t>(info.vertex_function),
++      " fragment=", static_cast<uint64_t>(info.fragment_function),
++      " formats=", flightPipelineColorHash(info.colors),
++      " depth=", static_cast<uint64_t>(info.depth_pixel_format),
++      " stencil=", static_cast<uint64_t>(info.stencil_pixel_format),
++      " samples=", static_cast<unsigned>(info.raster_sample_count),
++      " topology=", static_cast<unsigned>(info.input_primitive_topology),
++      " raster=", info.rasterization_enabled,
++      " alpha-to-coverage=", info.alpha_to_coverage_enabled));
++}
++
++void
++flightRecorderPipeline(obj_handle_t device,
++                       const WMTMeshRenderPipelineInfo &info,
++                       obj_handle_t pipeline) {
++  Logger::debug(str::format(
++      "flight pipeline-create kind=mesh device=", static_cast<uint64_t>(device),
++      " pso=", static_cast<uint64_t>(pipeline),
++      " object=", static_cast<uint64_t>(info.object_function),
++      " mesh=", static_cast<uint64_t>(info.mesh_function),
++      " fragment=", static_cast<uint64_t>(info.fragment_function),
++      " formats=", flightPipelineColorHash(info.colors),
++      " depth=", static_cast<uint64_t>(info.depth_pixel_format),
++      " stencil=", static_cast<uint64_t>(info.stencil_pixel_format),
++      " samples=", static_cast<unsigned>(info.raster_sample_count),
++      " payload=", info.payload_memory_length));
++}
++
++void
++flightRecorderPipeline(obj_handle_t device,
++                       const WMTTileRenderPipelineInfo &info,
++                       obj_handle_t pipeline) {
++  uint64_t formats = 1469598103934665603ull;
++  for (auto format : info.color_formats) {
++    formats ^= static_cast<uint64_t>(format);
++    formats *= 1099511628211ull;
++  }
++  Logger::debug(str::format(
++      "flight pipeline-create kind=tile device=", static_cast<uint64_t>(device),
++      " pso=", static_cast<uint64_t>(pipeline),
++      " function=", static_cast<uint64_t>(info.tile_function),
++      " formats=", formats,
++      " samples=", static_cast<unsigned>(info.raster_sample_count),
++      " tg-tile=", info.tgsize_matches_tile_size));
++}
++
++void
++flightRecorderTexture(const char *kind, obj_handle_t parent,
++                      const WMTTextureInfo &info, obj_handle_t texture,
++                      uint64_t offset, uint64_t bytes_per_row) {
++  Logger::debug(str::format(
++      "flight texture-create kind=", kind,
++      " parent=", static_cast<uint64_t>(parent),
++      " texture=", static_cast<uint64_t>(texture),
++      " gpu-resource=", info.gpu_resource_id,
++      " format=", static_cast<uint64_t>(info.pixel_format),
++      " size=", info.width, "x", info.height, "x", info.depth,
++      " array=", info.array_length,
++      " mips=", static_cast<unsigned>(info.mipmap_level_count),
++      " samples=", static_cast<unsigned>(info.sample_count),
++      " type=", static_cast<unsigned>(info.type),
++      " usage=", static_cast<unsigned>(info.usage),
++      " options=", static_cast<uint64_t>(info.options),
++      " offset=", offset, " row-bytes=", bytes_per_row));
++}
++
++void
++flightRecorderTextureView(obj_handle_t parent, obj_handle_t texture,
++                          WMTPixelFormat format, WMTTextureType type,
++                          uint16_t level_start, uint16_t level_count,
++                          uint16_t slice_start, uint16_t slice_count) {
++  Logger::debug(str::format(
++      "flight texture-view parent=", static_cast<uint64_t>(parent),
++      " texture=", static_cast<uint64_t>(texture),
++      " format=", static_cast<uint64_t>(format),
++      " type=", static_cast<unsigned>(type),
++      " levels=", level_start, "+", level_count,
++      " slices=", slice_start, "+", slice_count));
++}
++
+ Logger::Logger(const std::string &fileName)
+     : m_minLevel(getMinLogLevel()), m_fileName(fileName) {}
+ 
+@@ -67,7 +187,8 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
+       auto path = getFileName(m_fileName);
+ 
+       if (!path.empty())
+-        m_fileStream = std::ofstream(str::topath(path.c_str()).c_str());
++        m_fileStream = std::ofstream(str::topath(path.c_str()).c_str(),
++                                     std::ios::out | std::ios::app);
+     }
+ 
+     std::stringstream stream(message);
+@@ -75,7 +196,17 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
+ 
+     while (std::getline(stream, line, '\n')) {
+       std::stringstream outstream;
+-      outstream << prefix << line << std::endl;
++      const auto timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
++          std::chrono::steady_clock::now().time_since_epoch()).count();
++      outstream << timestamp << " pid="
++#ifdef _WIN32
++                << GetCurrentProcessId()
++#else
++                << getpid()
++#endif
++                << " tid="
++                << std::this_thread::get_id() << " " << prefix << line
++                << std::endl;
+ 
+       std::string adjusted = outstream.str();
+ 
+@@ -86,8 +217,10 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
+           std::cerr << adjusted;
+       }
+ 
+-      if (m_fileStream)
++      if (m_fileStream) {
+         m_fileStream << adjusted;
++        m_fileStream.flush();
++      }
+     }
+   }
+ }
+diff --git a/src/winemetal/Metal.hpp b/src/winemetal/Metal.hpp
+index 36630dd..4b4d291 100644
+--- a/src/winemetal/Metal.hpp
++++ b/src/winemetal/Metal.hpp
+@@ -6,6 +6,28 @@
+ #include <cstring>
+ #include <vector>
+ 
++namespace dxmt {
++void flightRecorderPipeline(obj_handle_t device,
++                            const WMTComputePipelineInfo &info,
++                            obj_handle_t pipeline);
++void flightRecorderPipeline(obj_handle_t device,
++                            const WMTRenderPipelineInfo &info,
++                            obj_handle_t pipeline);
++void flightRecorderPipeline(obj_handle_t device,
++                            const WMTMeshRenderPipelineInfo &info,
++                            obj_handle_t pipeline);
++void flightRecorderPipeline(obj_handle_t device,
++                            const WMTTileRenderPipelineInfo &info,
++                            obj_handle_t pipeline);
++void flightRecorderTexture(const char *kind, obj_handle_t parent,
++                           const WMTTextureInfo &info, obj_handle_t texture,
++                           uint64_t offset, uint64_t bytes_per_row);
++void flightRecorderTextureView(obj_handle_t parent, obj_handle_t texture,
++                               WMTPixelFormat format, WMTTextureType type,
++                               uint16_t level_start, uint16_t level_count,
++                               uint16_t slice_start, uint16_t slice_count);
++}
++
+ namespace WMT {
+ 
+ class String;
+@@ -240,9 +262,13 @@ public:
+       uint16_t slice_start, uint16_t slice_count, struct WMTTextureSwizzleChannels swizzle,
+       uint64_t &out_gpu_resource_id
+   ) {
+-    return Reference<Texture>(MTLTexture_newTextureView(
++    auto texture = Reference<Texture>(MTLTexture_newTextureView(
+         handle, format, texture_type, level_start, level_count, slice_start, slice_count, swizzle, &out_gpu_resource_id
+     ));
++    dxmt::flightRecorderTextureView(handle, texture.handle, format,
++                                    texture_type, level_start, level_count,
++                                    slice_start, slice_count);
++    return texture;
+   }
+ 
+   WMTPixelFormat
+@@ -290,7 +316,11 @@ class Buffer : public Resource {
+ public:
+   Reference<Texture>
+   newTexture(WMTTextureInfo &info, uint64_t offset, uint64_t bytes_per_row) {
+-    return Reference<Texture>(MTLBuffer_newTexture(handle, &info, offset, bytes_per_row));
++    auto texture = Reference<Texture>(
++        MTLBuffer_newTexture(handle, &info, offset, bytes_per_row));
++    dxmt::flightRecorderTexture("buffer", handle, info, texture.handle,
++                                offset, bytes_per_row);
++    return texture;
+   }
+ 
+   void
+@@ -811,7 +841,9 @@ public:
+ 
+   Reference<Texture>
+   newTexture(WMTTextureInfo &info) {
+-    return Reference<Texture>(MTLDevice_newTexture(handle, &info));
++    auto texture = Reference<Texture>(MTLDevice_newTexture(handle, &info));
++    dxmt::flightRecorderTexture("device", handle, info, texture.handle, 0, 0);
++    return texture;
+   }
+ 
+   Reference<Library>
+@@ -845,7 +877,10 @@ public:
+     info.binary_archives_for_lookup.set(nullptr);
+     info.num_binary_archives_for_lookup = 0;
+     info.fail_on_binary_archive_miss = false;
+-    return Reference<ComputePipelineState>(MTLDevice_newComputePipelineState(handle, &info, error.out_handle()));
++    auto pipeline = Reference<ComputePipelineState>(
++        MTLDevice_newComputePipelineState(handle, &info, error.out_handle()));
++    dxmt::flightRecorderPipeline(handle, info, pipeline.handle);
++    return pipeline;
+   }
+ 
+   Reference<ComputePipelineState>
+@@ -858,27 +893,42 @@ public:
+     info.binary_archives_for_lookup.set(nullptr);
+     info.num_binary_archives_for_lookup = 0;
+     info.fail_on_binary_archive_miss = false;
+-    return Reference<ComputePipelineState>(MTLDevice_newComputePipelineState(handle, &info, error.out_handle()));
++    auto pipeline = Reference<ComputePipelineState>(
++        MTLDevice_newComputePipelineState(handle, &info, error.out_handle()));
++    dxmt::flightRecorderPipeline(handle, info, pipeline.handle);
++    return pipeline;
+   }
+ 
+   Reference<RenderPipelineState>
+   newRenderPipelineState(const WMTRenderPipelineInfo &info, Error &error) {
+-    return Reference<RenderPipelineState>(MTLDevice_newRenderPipelineState(handle, &info, error.out_handle()));
++    auto pipeline = Reference<RenderPipelineState>(
++        MTLDevice_newRenderPipelineState(handle, &info, error.out_handle()));
++    dxmt::flightRecorderPipeline(handle, info, pipeline.handle);
++    return pipeline;
+   }
+ 
+   Reference<ComputePipelineState>
+   newComputePipelineState(const WMTComputePipelineInfo &info, Error &error) {
+-    return Reference<ComputePipelineState>(MTLDevice_newComputePipelineState(handle, &info, error.out_handle()));
++    auto pipeline = Reference<ComputePipelineState>(
++        MTLDevice_newComputePipelineState(handle, &info, error.out_handle()));
++    dxmt::flightRecorderPipeline(handle, info, pipeline.handle);
++    return pipeline;
+   }
+ 
+   Reference<RenderPipelineState>
+   newRenderPipelineState(const WMTMeshRenderPipelineInfo &info, Error &error) {
+-    return Reference<RenderPipelineState>(MTLDevice_newMeshRenderPipelineState(handle, &info, error.out_handle()));
++    auto pipeline = Reference<RenderPipelineState>(
++        MTLDevice_newMeshRenderPipelineState(handle, &info, error.out_handle()));
++    dxmt::flightRecorderPipeline(handle, info, pipeline.handle);
++    return pipeline;
+   }
+ 
+   Reference<RenderPipelineState>
+   newRenderPipelineState(const WMTTileRenderPipelineInfo &info, Error &error) {
+-    return Reference<RenderPipelineState>(MTLDevice_newTileRenderPipelineState(handle, &info, error.out_handle()));
++    auto pipeline = Reference<RenderPipelineState>(
++        MTLDevice_newTileRenderPipelineState(handle, &info, error.out_handle()));
++    dxmt::flightRecorderPipeline(handle, info, pipeline.handle);
++    return pipeline;
+   }
+ 
+   Reference<Fence>
+@@ -1188,4 +1238,4 @@ InitializeTileRenderPipelineInfo(WMTTileRenderPipelineInfo &info) {
+   info.fail_on_binary_archive_miss = false;
+ }
+ 
+-} // namespace WMT
+\ No newline at end of file
++} // namespace WMT

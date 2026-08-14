@@ -286,7 +286,7 @@ jobs:
           test -d UTM.xcarchive/Products/Applications/UTM.app
 
           /usr/libexec/PlistBuddy \
-            -c "Set :CFBundleIdentifier com.utmapp.UTMdxquick" \
+            -c "Set :CFBundleIdentifier com.utmapp.UTMdxflight" \
             UTM.xcarchive/Products/Applications/UTM.app/Info.plist
 
           echo "Archive created:"
@@ -355,7 +355,7 @@ jobs:
             "$APP_PATH/Info.plist"
 
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
-            "$APP_PATH/Info.plist")" = "com.utmapp.UTMdxquick"
+            "$APP_PATH/Info.plist")" = "com.utmapp.UTMdxflight"
 
           /usr/libexec/PlistBuddy \
             -c "Print :MinimumOSVersion" \
@@ -388,7 +388,7 @@ jobs:
         if: inputs.build_target == 'full'
         uses: actions/upload-artifact@v4
         with:
-          name: UTM-HV-Windows-Quick-Settings-AGX-iPadOS-16.3-arm64
+          name: UTM-HV-Windows-Quick-Settings-Flight-Recorder-iPadOS-16.3-arm64
           path: UTM-HV.ipa
           if-no-files-found: error
           compression-level: 0

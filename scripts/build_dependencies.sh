@@ -223,7 +223,7 @@ download_all () {
     VIRGLRENDERER_DIR="$BUILD_DIR/$(basename $VIRGLRENDERER_REPO)"
     git -C "$VIRGLRENDERER_DIR" reset --hard "$VIRGLRENDERER_COMMIT"
     git -C "$VIRGLRENDERER_DIR" apply \
-        "$PATCHES_DIR/virglrenderer-neptune-lifecycle-diagnostics.patch"
+        "$PATCHES_DIR/virglrenderer-neptune-flight-recorder.patch"
     clone $HYPERVISOR_REPO $HYPERVISOR_COMMIT
     clone $LIBUCONTEXT_REPO $LIBUCONTEXT_COMMIT
     clone $MESA_REPO $MESA_COMMIT
@@ -267,7 +267,7 @@ download_all () {
     # idempotently.
     git -C "$DXMT_DIR" reset --hard "$DXMT_COMMIT"
     git -C "$DXMT_DIR" apply "$PATCHES_DIR/dxmt-a8unorm-emulation.patch"
-    git -C "$DXMT_DIR" apply "$PATCHES_DIR/dxmt-lifecycle-diagnostics.patch"
+    git -C "$DXMT_DIR" apply "$PATCHES_DIR/dxmt-flight-recorder.patch"
     clone $D3DMETAL_REPO $D3DMETAL_COMMIT
 }
 
