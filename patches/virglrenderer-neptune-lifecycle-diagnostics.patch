@@ -132,20 +132,23 @@ index fa6c750..16897ca 100644
  }
 
 diff --git a/src/neptune/npt_event.c b/src/neptune/npt_event.c
-index 62a6ae7..ed7dafd 100644
+index 62a6ae7..127f7a9 100644
 --- a/src/neptune/npt_event.c
 +++ b/src/neptune/npt_event.c
-@@ -263,6 +263,9 @@ npt_event_register(struct npt_context *ctx, uint64_t token)
+@@ -262,7 +262,11 @@ npt_event_register(struct npt_context *ctx, uint64_t token)
+       mtx_unlock(&ctx->event_mutex);
        return;
     }
-    event_proxy_create_locked(ctx, token, /*initial_refcount=*/1);
-+   npt_lifecycle_log("event-register ctx=%u token=0x%016" PRIx64
-+                     " proxies=%u", ctx->ctx_id, token,
-+                     _mesa_hash_table_num_entries(ctx->event_proxies));
+-   event_proxy_create_locked(ctx, token, /*initial_refcount=*/1);
++   pr = event_proxy_create_locked(ctx, token, /*initial_refcount=*/1);
++   if (pr)
++      npt_lifecycle_log("event-register ctx=%u token=0x%016" PRIx64
++                        " proxies=%u", ctx->ctx_id, token,
++                        _mesa_hash_table_num_entries(ctx->event_proxies));
     mtx_unlock(&ctx->event_mutex);
  }
 
-@@ -349,6 +352,9 @@ npt_event_release(struct npt_context *ctx, uint64_t token)
+@@ -349,6 +353,9 @@ npt_event_release(struct npt_context *ctx, uint64_t token)
        return;
     }
     npt_event_proxy_unref_locked(ctx, e->data, e);
@@ -156,18 +159,18 @@ index 62a6ae7..ed7dafd 100644
  }
 
 diff --git a/src/neptune/npt_queue.c b/src/neptune/npt_queue.c
-index f6d518a..4785f61 100644
+index f6d518a..ef97e9c 100644
 --- a/src/neptune/npt_queue.c
 +++ b/src/neptune/npt_queue.c
-@@ -268,6 +268,8 @@ npt_queue_create(struct npt_context *ctx, uint32_t ring_idx)
-    queue->context  = ctx;
-    queue->ring_idx = ring_idx;
+@@ -273,6 +273,8 @@ npt_queue_create(struct npt_context *ctx, uint32_t ring_idx)
+       return NULL;
+    }
 
 +   npt_lifecycle_log("queue-create ctx=%u ring=%u", ctx->ctx_id, ring_idx);
 +
-    if (npt_queue_sync_thread_init(queue)) {
-       free(queue);
-       return NULL;
+    return queue;
+ }
+
 @@ -281,6 +283,8 @@ npt_queue_destroy(struct npt_queue *queue)
  {
     if (!queue)

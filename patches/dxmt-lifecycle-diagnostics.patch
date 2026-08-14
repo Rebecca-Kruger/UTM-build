@@ -1,28 +1,23 @@
 diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
-index 4be71ce..27abc4e 100644
+index 4be71ce..17aec4f 100644
 --- a/src/d3d11/d3d11_swapchain.cpp
 +++ b/src/d3d11/d3d11_swapchain.cpp
-@@ -144,6 +144,10 @@ public:
-       monitor_(wsi::getWindowMonitor(hWnd)),
-       hud(WMT::DeveloperHUDProperties::instance()) {
-
+@@ -215,9 +215,14 @@ public:
+     ResizeBuffers(0, desc_.Width, desc_.Height, DXGI_FORMAT_UNKNOWN, desc_.Flags);
+     if (!fullscreen_desc_.Windowed)
+       EnterFullscreenMode(nullptr);
 +    Logger::info(str::format("lifecycle swapchain-create ptr=",
 +                             reinterpret_cast<uintptr_t>(this),
 +                             " hwnd=", reinterpret_cast<uintptr_t>(hWnd)));
-+
-     native_view_ = WMT::CreateMetalViewFromHWND((intptr_t)hWnd, pDevice->GetMTLDevice(), layer_weak_);
-
-     if (!native_view_) {
-@@ -218,6 +222,8 @@ public:
    };
 
    ~MTLD3D11SwapChain() {
-+    Logger::info(str::format("lifecycle swapchain-destroy ptr=",
++    Logger::info(str::format("lifecycle swapchain-destroy-begin ptr=",
 +                             reinterpret_cast<uintptr_t>(this)));
      device_context_->WaitUntilGPUIdle();
      WMT::ReleaseMetalView(native_view_);
      native_view_ = {};
-@@ -1140,4 +1146,4 @@ CreateSwapChain(
+@@ -1140,4 +1145,4 @@ CreateSwapChain(
    return S_OK;
  };
 
@@ -30,7 +25,7 @@ index 4be71ce..27abc4e 100644
 \ No newline at end of file
 +} // namespace dxmt
 diff --git a/src/dxmt/dxmt_command_queue.cpp b/src/dxmt/dxmt_command_queue.cpp
-index 89ffc37..44daa76 100644
+index 89ffc37..9583e40 100644
 --- a/src/dxmt/dxmt_command_queue.cpp
 +++ b/src/dxmt/dxmt_command_queue.cpp
 @@ -20,6 +20,7 @@
@@ -58,18 +53,14 @@ index 89ffc37..44daa76 100644
      encodeThread([this]() { this->EncodingThread(); }),
      finishThread([this]() { this->WaitForFinishThread(); }),
      device(device),
-@@ -55,6 +60,10 @@ CommandQueue::CommandQueue(WMT::Device device) :
-     argument_encoding_ctx(*this, device, cmd_library),
-     initializer(device),
-     counter_pool(device) {
+@@ -70,9 +75,15 @@ CommandQueue::CommandQueue(WMT::Device device) :
+     } catch (const std::invalid_argument &) {
+     }
+   }
 +  auto live = diagnostic_live_queues.fetch_add(1) + 1;
 +  Logger::info(str::format("lifecycle queue-create id=", diagnostic_id_,
 +                           " ptr=", reinterpret_cast<uintptr_t>(this),
 +                           " live=", live));
-   for (unsigned i = 0; i < kCommandChunkCount; i++) {
-     auto &chunk = chunks[i];
-     chunk.queue = this;
-@@ -73,6 +82,8 @@ CommandQueue::CommandQueue(WMT::Device device) :
  }
 
  CommandQueue::~CommandQueue() {
@@ -109,7 +100,7 @@ index e109af7..11a3732 100644
 \ No newline at end of file
 +} // namespace dxmt
 diff --git a/src/dxmt/dxmt_device.cpp b/src/dxmt/dxmt_device.cpp
-index dc62b1b..0215519 100644
+index dc62b1b..bac56a0 100644
 --- a/src/dxmt/dxmt_device.cpp
 +++ b/src/dxmt/dxmt_device.cpp
 @@ -2,6 +2,7 @@
@@ -120,34 +111,86 @@ index dc62b1b..0215519 100644
  #include <TargetConditionals.h>
 
  namespace dxmt {
-@@ -26,6 +27,10 @@ public:
-   };
-
-   DeviceImpl(const DEVICE_DESC &desc) : device_(desc.device), cmd_queue_(device_) {
+@@ -69,6 +70,15 @@ public:
+       max_object_threadgroups_ = -1ull;
+       device_.setShouldMaximizeConcurrentCompilation(true);
+     }
 +    Logger::info(str::format("lifecycle device-create ptr=",
 +                             reinterpret_cast<uintptr_t>(this),
 +                             " metal-device=",
-+                             reinterpret_cast<uintptr_t>(device_.handle)));
-     uint64_t os_major_version = 0, os_minor_version = 0;
-     int version_conf = Config::getInstance().getOption<int>("dxmt.shaderMetalVersion", 0);
-     switch (version_conf) {
-@@ -71,6 +76,11 @@ public:
-     }
-   }
-
-+  ~DeviceImpl() override {
-+    Logger::info(str::format("lifecycle device-destroy ptr=",
-+                             reinterpret_cast<uintptr_t>(this)));
++                             static_cast<uint64_t>(device_.handle)));
 +  }
 +
++  ~DeviceImpl() override {
++    Logger::info(str::format("lifecycle device-destroy-begin ptr=",
++                             reinterpret_cast<uintptr_t>(this)));
+   }
+
  private:
-   WMT::Reference<WMT::Device> device_;
-   CommandQueue cmd_queue_;
+diff --git a/src/dxmt/dxmt_presenter.cpp b/src/dxmt/dxmt_presenter.cpp
+index 86c9d72..a1e5abd 100644
+--- a/src/dxmt/dxmt_presenter.cpp
++++ b/src/dxmt/dxmt_presenter.cpp
+@@ -3,6 +3,7 @@
+ #include "Metal.hpp"
+ #include "dxmt_format.hpp"
+ #include "dxmt_presenter.hpp"
++#include "log/log.hpp"
+ #include "util_likely.hpp"
+
+
+@@ -110,6 +111,10 @@ Presenter::synchronizeLayerProperties() {
+   );
+
+   if (display_setting_version != display_setting_version_) {
++    Logger::debug(str::format("lifecycle display-settings old=",
++                              display_setting_version_, " new=",
++                              display_setting_version, " layer=",
++                              static_cast<uint64_t>(layer_.handle)));
+     display_setting_version_ = display_setting_version;
+     pso_valid.clear();
+   }
+@@ -234,4 +239,4 @@ Presenter::buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_
+   }
+ }
+
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt
 diff --git a/src/util/log/log.cpp b/src/util/log/log.cpp
-index 96ced95..e201272 100644
+index 96ced95..04727a4 100644
 --- a/src/util/log/log.cpp
 +++ b/src/util/log/log.cpp
-@@ -86,8 +86,10 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
+@@ -9,6 +9,7 @@
+  */
+
+ #include <iostream>
++#include <chrono>
+ #include <utility>
+
+ #include "log.hpp"
+@@ -67,7 +68,8 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
+       auto path = getFileName(m_fileName);
+
+       if (!path.empty())
+-        m_fileStream = std::ofstream(str::topath(path.c_str()).c_str());
++        m_fileStream = std::ofstream(str::topath(path.c_str()).c_str(),
++                                     std::ios::out | std::ios::app);
+     }
+
+     std::stringstream stream(message);
+@@ -75,7 +77,9 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
+
+     while (std::getline(stream, line, '\n')) {
+       std::stringstream outstream;
+-      outstream << prefix << line << std::endl;
++      const auto timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
++          std::chrono::steady_clock::now().time_since_epoch()).count();
++      outstream << timestamp << " " << prefix << line << std::endl;
+
+       std::string adjusted = outstream.str();
+
+@@ -86,8 +90,10 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
            std::cerr << adjusted;
        }
 
