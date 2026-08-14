@@ -3,8 +3,16 @@ name: Build UTM HV for iOS 16.3
 on:
   workflow_dispatch:
     inputs:
+      build_target:
+        description: Build the full IPA or only prebuild the LLVM cache
+        required: true
+        type: choice
+        options:
+          - full
+          - llvm-cache
+        default: full
       force_rebuild:
-        description: Force rebuild the iOS sysroot
+        description: Force rebuild the iOS sysroot (full build only)
         required: false
         type: boolean
         default: false
@@ -30,7 +38,7 @@ env:
 
 jobs:
   build-ios-hv:
-    name: Build iOS arm64 HV IPA
+    name: Build iOS arm64 dependencies / HV IPA
     runs-on: macos-15
     timeout-minutes: 360
 
@@ -93,6 +101,7 @@ jobs:
       # ---------------------------------------------------------------
       - name: Restore iOS arm64 sysroot cache
         id: sysroot-cache
+        if: inputs.build_target == 'full'
         uses: actions/cache@v4
         with:
           path: |
@@ -103,10 +112,30 @@ jobs:
             ${{ hashFiles('scripts/build_dependencies.sh', 'patches/**') }}
 
       # ---------------------------------------------------------------
-      # 5. Force rebuild when requested
+      # 5. Restore LLVM independently from the rest of the sysroot
+      #
+      # LLVM is stable across most QEMU, virglrenderer, Mesa and DXMT
+      # patches. Its focused key avoids paying the ~23 minute LLVM build
+      # cost whenever another dependency invalidates the full sysroot.
+      # ---------------------------------------------------------------
+      - name: Restore iOS arm64 LLVM cache
+        id: llvm-cache
+        if: >-
+          inputs.build_target == 'llvm-cache' ||
+          steps.sysroot-cache.outputs.cache-hit != 'true' ||
+          inputs.force_rebuild == true
+        uses: actions/cache@v4
+        with:
+          path: .cache/llvm-ios-arm64
+          key: >-
+            utm-llvm15-ios-arm64-xcode-26.0.1-v1-
+            ${{ hashFiles('scripts/llvm_cache_config.sh', 'patches/llvm-project-15.0.7.src.patch') }}
+
+      # ---------------------------------------------------------------
+      # 6. Force rebuild when requested
       # ---------------------------------------------------------------
       - name: Remove restored sysroot for forced rebuild
-        if: inputs.force_rebuild == true
+        if: inputs.build_target == 'full' && inputs.force_rebuild == true
         shell: bash
         run: |
           rm -rf \
@@ -114,12 +143,15 @@ jobs:
             "${SYSROOT_UPPER:?}"
 
       # ---------------------------------------------------------------
-      # 6. Install host-side dependencies
+      # 7. Install host-side dependencies
       #
       # This includes the explicitly required SPIRV-Tools package.
       # ---------------------------------------------------------------
       - name: Install build requirements
-        if: steps.sysroot-cache.outputs.cache-hit != 'true' || inputs.force_rebuild == true
+        if: >-
+          inputs.build_target == 'llvm-cache' ||
+          steps.sysroot-cache.outputs.cache-hit != 'true' ||
+          inputs.force_rebuild == true
         shell: bash
         run: |
           set -euo pipefail
@@ -167,15 +199,18 @@ jobs:
           pkg-config --modversion llvmspirvlib || true
 
       # ---------------------------------------------------------------
-      # 7. Build only iOS arm64
+      # 8. Build only iOS arm64
       #
       # No simulator, TCI, macOS or visionOS sysroots are built.
       # ---------------------------------------------------------------
       - name: Build iOS arm64 sysroot
-        if: steps.sysroot-cache.outputs.cache-hit != 'true' || inputs.force_rebuild == true
+        if: >-
+          inputs.build_target == 'full' &&
+          (steps.sysroot-cache.outputs.cache-hit != 'true' || inputs.force_rebuild == true)
         shell: bash
         env:
           NCPU: "0"
+          LLVM_CACHE_DIR: ${{ github.workspace }}/.cache/llvm-ios-arm64
         run: |
           set -euo pipefail
 
@@ -183,10 +218,25 @@ jobs:
             -p ios \
             -a arm64
 
+      - name: Prebuild iOS arm64 LLVM cache
+        if: inputs.build_target == 'llvm-cache'
+        shell: bash
+        env:
+          NCPU: "0"
+          LLVM_CACHE_DIR: ${{ github.workspace }}/.cache/llvm-ios-arm64
+        run: |
+          set -euo pipefail
+
+          ./scripts/build_dependencies.sh \
+            --llvm-only \
+            -p ios \
+            -a arm64
+
       # ---------------------------------------------------------------
-      # 8. Verify that the required sysroot exists
+      # 9. Verify that the required sysroot exists
       # ---------------------------------------------------------------
       - name: Verify iOS sysroot
+        if: inputs.build_target == 'full'
         shell: bash
         run: |
           set -euo pipefail
@@ -213,12 +263,13 @@ jobs:
           du -sh "${SYSROOT_PATH}"
 
       # ---------------------------------------------------------------
-      # 9. Compile only the full iOS scheme
+      # 10. Compile only the full iOS scheme
       #
       # This is the full UTM build used for HV packaging.
       # It is not UTM SE and does not use TCI.
       # ---------------------------------------------------------------
       - name: Build UTM iOS archive
+        if: inputs.build_target == 'full'
         shell: bash
         run: |
           set -euo pipefail
@@ -242,21 +293,23 @@ jobs:
           du -sh UTM.xcarchive
 
       # ---------------------------------------------------------------
-      # 10. Install only the packager required for fake signing
+      # 11. Install only the packager required for fake signing
       # ---------------------------------------------------------------
       - name: Install HV packaging requirement
+        if: inputs.build_target == 'full'
         shell: bash
         run: |
           brew install ldid
           ldid -h >/dev/null 2>&1 || true
 
       # ---------------------------------------------------------------
-      # 11. Package only ipa-hv
+      # 12. Package only ipa-hv
       #
       # package.sh adds the private Hypervisor entitlement and removes
       # the dynamic-codesigning entitlement used by the normal JIT IPA.
       # ---------------------------------------------------------------
       - name: Package UTM-HV IPA
+        if: inputs.build_target == 'full'
         shell: bash
         run: |
           set -euo pipefail
@@ -276,9 +329,10 @@ jobs:
           ls -lh UTM-HV.ipa
 
       # ---------------------------------------------------------------
-      # 12. Inspect packaged application and entitlements
+      # 13. Inspect packaged application and entitlements
       # ---------------------------------------------------------------
       - name: Verify UTM-HV IPA
+        if: inputs.build_target == 'full'
         shell: bash
         run: |
           set -euo pipefail
@@ -328,9 +382,10 @@ jobs:
           echo "UTM-HV verification completed successfully."
 
       # ---------------------------------------------------------------
-      # 13. Upload only the final HV IPA
+      # 14. Upload only the final HV IPA
       # ---------------------------------------------------------------
       - name: Upload UTM-HV IPA
+        if: inputs.build_target == 'full'
         uses: actions/upload-artifact@v4
         with:
           name: UTM-HV-GPU-Diagnostics-iPadOS-16.3-arm64

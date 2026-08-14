@@ -46,13 +46,14 @@ version_check() {
 }
 
 usage () {
-    echo "Usage: [VARIABLE...] $(basename $0) [-p platform] [-a architecture] [-q qemu_path] [-d] [-r] [-x]"
+    echo "Usage: [VARIABLE...] $(basename $0) [-p platform] [-a architecture] [-q qemu_path] [-d] [-r] [-l] [-x]"
     echo ""
     echo "  -p platform      Target platform. Default ios. [ios|ios_simulator|ios-tci|ios_simulator-tci|macos|visionos|visionos_simulator]"
     echo "  -a architecture  Target architecture. Default arm64. [armv7|armv7s|arm64|i386|x86_64]"
     echo "  -q qemu_path     Do not download QEMU, use qemu_path instead."
     echo "  -d, --download   Force re-download of source even if already downloaded."
     echo "  -r, --rebuild    Avoid cleaning build directory."
+    echo "  -l, --llvm-only  Build or validate only the independent LLVM cache."
     echo "  -x, --debug      Build for debug."
     echo ""
     echo "  VARIABLEs are:"
@@ -254,7 +255,11 @@ download_all () {
     
     clone $MOLTENVK_REPO $MOLTENVK_COMMIT
     clone_moltenvk_dependences $MOLTENVK_REPO
-    download $LLVM15_SRC
+    if llvm_cache_is_valid; then
+        echo "${GREEN}LLVM cache is valid; skipping LLVM source download.${NC}"
+    else
+        download $LLVM15_SRC
+    fi
     clone $DXMT_REPO $DXMT_COMMIT
     DXMT_DIR="$BUILD_DIR/$(basename $DXMT_REPO)"
     # Apple-family Metal cannot render A8Unorm attachments. Reset first so
@@ -708,6 +713,7 @@ cmake_build () {
         ;;
     esac
     CMAKE_TOOLCHAIN="$(realpath "$BUILD_DIR")/cross.cmake"
+    CMAKE_INSTALL_DESTINATION="${CMAKE_INSTALL_DESTINATION:-$PREFIX}"
     if [ ! -f "$CMAKE_TOOLCHAIN" ]; then
         generate_cmake_toolchain "$CMAKE_TOOLCHAIN"
     fi
@@ -721,7 +727,7 @@ cmake_build () {
 
         echo "${GREEN}Configuring ${NAME}...${NC}"
         cmake_clean_env -S . -B "$BUILDDIR" \
-            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_INSTALL_PREFIX="$CMAKE_INSTALL_DESTINATION" \
             -DCMAKE_BUILD_TYPE="$BUILD_CONFIGURATION" \
             -DCMAKE_TOOLCHAIN_FILE="$CMAKE_TOOLCHAIN" \
             "$@"
@@ -910,9 +916,57 @@ build_vulkan_drivers () {
     patch_vulkan_icd "$PREFIX/share/vulkan/icd.d/MoltenVK_icd.json"
 }
 
-build_d3d_drivers () {
+llvm_cache_signature () {
+    printf '%s\n' \
+        "$LLVM_CACHE_SCHEMA:$LLVM_CACHE_SOURCE_NAME:$PLATFORM_FAMILY_NAME:$ARCH:$SDKVERSION:$SDKMINVER:$BUILD_CONFIGURATION"
+}
+
+llvm_cache_is_valid () {
+    [ -n "${LLVM_CACHE_DIR:-}" ] || return 1
+    [ -f "$LLVM_CACHE_DIR/.utm-llvm-cache-manifest" ] || return 1
+    [ "$(cat "$LLVM_CACHE_DIR/.utm-llvm-cache-manifest")" = "$(llvm_cache_signature)" ] || return 1
+    [ -f "$LLVM_CACHE_DIR/include/llvm/IR/Module.h" ] || return 1
+    [ -f "$LLVM_CACHE_DIR/lib/libLLVMCore.a" ] || return 1
+    [ -f "$LLVM_CACHE_DIR/lib/libLLVMSupport.a" ] || return 1
+}
+
+install_llvm_dependency () {
     LLVM15_NAME=$(basename "${LLVM15_SRC%.tar.*}")
-    cmake_build "$BUILD_DIR/$LLVM15_NAME/llvm" -DLLVM_ENABLE_ZSTD=Off -DLLVM_TARGETS_TO_BUILD="" -DLLVM_BUILD_TOOLS=Off -DLLVM_VERSION_PRINTER_SHOW_HOST_TARGET_INFO=Off
+    if [ "$LLVM15_NAME" != "$LLVM_CACHE_SOURCE_NAME" ]; then
+        echo >&2 "${RED}LLVM source changed to $LLVM15_NAME; update scripts/llvm_cache_config.sh.${NC}"
+        exit 1
+    fi
+
+    if [ -z "${LLVM_CACHE_DIR:-}" ]; then
+        cmake_build "$BUILD_DIR/$LLVM15_NAME/llvm" $LLVM_CACHE_CMAKE_OPTIONS
+        return
+    fi
+
+    mkdir -p "$LLVM_CACHE_DIR"
+    LLVM_CACHE_DIR="$(realpath "$LLVM_CACHE_DIR")"
+    if llvm_cache_is_valid; then
+        echo "${GREEN}Using cached LLVM from $LLVM_CACHE_DIR.${NC}"
+    else
+        if [ -d "$LLVM_CACHE_DIR" ] && [ -n "$(find "$LLVM_CACHE_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+            echo >&2 "${RED}LLVM cache exists but is incomplete or incompatible: $LLVM_CACHE_DIR${NC}"
+            exit 1
+        fi
+        echo "${GREEN}Building LLVM into independent cache $LLVM_CACHE_DIR.${NC}"
+        CMAKE_INSTALL_DESTINATION="$LLVM_CACHE_DIR" \
+            cmake_build "$BUILD_DIR/$LLVM15_NAME/llvm" $LLVM_CACHE_CMAKE_OPTIONS
+        llvm_cache_signature > "$LLVM_CACHE_DIR/.utm-llvm-cache-manifest"
+        llvm_cache_is_valid || {
+            echo >&2 "${RED}LLVM cache validation failed after build.${NC}"
+            exit 1
+        }
+    fi
+
+    echo "${GREEN}Merging cached LLVM into $PREFIX.${NC}"
+    rsync -a --exclude '.utm-llvm-cache-manifest' "$LLVM_CACHE_DIR/" "$PREFIX/"
+}
+
+build_d3d_drivers () {
+    install_llvm_dependency
     (
         case $PLATFORM in
         ios* )
@@ -1028,6 +1082,7 @@ ARCH=
 REBUILD=
 QEMU_DIR=
 REDOWNLOAD=
+LLVM_ONLY=
 PLATFORM_FAMILY_NAME=
 while [ "x$1" != "x" ]; do
     case $1 in
@@ -1040,6 +1095,9 @@ while [ "x$1" != "x" ]; do
         ;;
     -r | --rebuild )
         REBUILD=y
+        ;;
+    -l | --llvm-only )
+        LLVM_ONLY=y
         ;;
     -q | --qemu )
         QEMU_DIR="$2"
@@ -1169,6 +1227,7 @@ PATCHES_DIR="$BASEDIR/../patches"
 
 # Include URL list
 source "$PATCHES_DIR/sources"
+source "$BASEDIR/llvm_cache_config.sh"
 
 if [ -z "$QEMU_DIR" ]; then
     FILE="$(basename $QEMU_SRC)"
@@ -1245,6 +1304,22 @@ export LDFLAGS
 
 check_env
 echo "${GREEN}Starting build for ${PLATFORM_FAMILY_NAME} ${ARCH} [${NCPU} jobs]${NC}"
+
+if [ -n "$LLVM_ONLY" ]; then
+    if [ -z "${LLVM_CACHE_DIR:-}" ]; then
+        echo >&2 "${RED}LLVM_CACHE_DIR is required for --llvm-only.${NC}"
+        exit 1
+    fi
+    if llvm_cache_is_valid; then
+        echo "${GREEN}LLVM cache is already valid.${NC}"
+        exit 0
+    fi
+    mkdir -p "$BUILD_DIR"
+    download $LLVM15_SRC
+    install_llvm_dependency
+    echo "${GREEN}LLVM cache is ready.${NC}"
+    exit 0
+fi
 
 if [ ! -f "$BUILD_DIR/BUILD_SUCCESS" ]; then
     if [ ! -z "$REBUILD" ]; then
