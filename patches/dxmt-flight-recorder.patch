@@ -268,10 +268,10 @@ index e109af7..5d05875 100644
 \ No newline at end of file
 +} // namespace dxmt
 diff --git a/src/dxmt/dxmt_context.cpp b/src/dxmt/dxmt_context.cpp
-index 5445501..31a9822 100644
+index 5445501..7da1b40 100644
 --- a/src/dxmt/dxmt_context.cpp
 +++ b/src/dxmt/dxmt_context.cpp
-@@ -24,6 +24,7 @@
+@@ -24,11 +24,126 @@
  #include "dxmt_occlusion_query.hpp"
  #include "dxmt_presenter.hpp"
  #include "wsi_platform.hpp"
@@ -279,7 +279,126 @@ index 5445501..31a9822 100644
  #include <cstdint>
  #include <cfloat>
  
-@@ -859,8 +860,188 @@ ArgumentEncodingContext::$$setEncodingContext(uint64_t seq_id, uint64_t frame_id
+ namespace dxmt {
+ 
++static uint64_t
++flightPipelineColorHash(const WMTColorAttachmentBlendInfo *colors) {
++  uint64_t hash = 1469598103934665603ull;
++  for (unsigned i = 0; i < 8; i++) {
++    hash ^= static_cast<uint64_t>(colors[i].pixel_format);
++    hash *= 1099511628211ull;
++    hash ^= static_cast<uint64_t>(colors[i].write_mask) |
++            (static_cast<uint64_t>(colors[i].blending_enabled) << 8) |
++            (static_cast<uint64_t>(colors[i].rgb_blend_operation) << 16) |
++            (static_cast<uint64_t>(colors[i].alpha_blend_operation) << 24);
++    hash *= 1099511628211ull;
++  }
++  return hash;
++}
++
++void
++flightRecorderPipeline(obj_handle_t device,
++                       const WMTComputePipelineInfo &info,
++                       obj_handle_t pipeline) {
++  Logger::debug(str::format(
++      "flight pipeline-create kind=compute device=", static_cast<uint64_t>(device),
++      " pso=", static_cast<uint64_t>(pipeline),
++      " function=", static_cast<uint64_t>(info.compute_function),
++      " tg-multiple=", info.tgsize_is_multiple_of_sgwidth,
++      " immutable=", info.immutable_buffers));
++}
++
++void
++flightRecorderPipeline(obj_handle_t device,
++                       const WMTRenderPipelineInfo &info,
++                       obj_handle_t pipeline) {
++  Logger::debug(str::format(
++      "flight pipeline-create kind=render device=", static_cast<uint64_t>(device),
++      " pso=", static_cast<uint64_t>(pipeline),
++      " vertex=", static_cast<uint64_t>(info.vertex_function),
++      " fragment=", static_cast<uint64_t>(info.fragment_function),
++      " formats=", flightPipelineColorHash(info.colors),
++      " depth=", static_cast<uint64_t>(info.depth_pixel_format),
++      " stencil=", static_cast<uint64_t>(info.stencil_pixel_format),
++      " samples=", static_cast<unsigned>(info.raster_sample_count),
++      " topology=", static_cast<unsigned>(info.input_primitive_topology),
++      " raster=", info.rasterization_enabled,
++      " alpha-to-coverage=", info.alpha_to_coverage_enabled));
++}
++
++void
++flightRecorderPipeline(obj_handle_t device,
++                       const WMTMeshRenderPipelineInfo &info,
++                       obj_handle_t pipeline) {
++  Logger::debug(str::format(
++      "flight pipeline-create kind=mesh device=", static_cast<uint64_t>(device),
++      " pso=", static_cast<uint64_t>(pipeline),
++      " object=", static_cast<uint64_t>(info.object_function),
++      " mesh=", static_cast<uint64_t>(info.mesh_function),
++      " fragment=", static_cast<uint64_t>(info.fragment_function),
++      " formats=", flightPipelineColorHash(info.colors),
++      " depth=", static_cast<uint64_t>(info.depth_pixel_format),
++      " stencil=", static_cast<uint64_t>(info.stencil_pixel_format),
++      " samples=", static_cast<unsigned>(info.raster_sample_count),
++      " payload=", info.payload_memory_length));
++}
++
++void
++flightRecorderPipeline(obj_handle_t device,
++                       const WMTTileRenderPipelineInfo &info,
++                       obj_handle_t pipeline) {
++  uint64_t formats = 1469598103934665603ull;
++  for (auto format : info.color_formats) {
++    formats ^= static_cast<uint64_t>(format);
++    formats *= 1099511628211ull;
++  }
++  Logger::debug(str::format(
++      "flight pipeline-create kind=tile device=", static_cast<uint64_t>(device),
++      " pso=", static_cast<uint64_t>(pipeline),
++      " function=", static_cast<uint64_t>(info.tile_function),
++      " formats=", formats,
++      " samples=", static_cast<unsigned>(info.raster_sample_count),
++      " tg-tile=", info.tgsize_matches_tile_size));
++}
++
++void
++flightRecorderTexture(const char *kind, obj_handle_t parent,
++                      const WMTTextureInfo &info, obj_handle_t texture,
++                      uint64_t offset, uint64_t bytes_per_row) {
++  Logger::debug(str::format(
++      "flight texture-create kind=", kind,
++      " parent=", static_cast<uint64_t>(parent),
++      " texture=", static_cast<uint64_t>(texture),
++      " gpu-resource=", info.gpu_resource_id,
++      " format=", static_cast<uint64_t>(info.pixel_format),
++      " size=", info.width, "x", info.height, "x", info.depth,
++      " array=", info.array_length,
++      " mips=", static_cast<unsigned>(info.mipmap_level_count),
++      " samples=", static_cast<unsigned>(info.sample_count),
++      " type=", static_cast<unsigned>(info.type),
++      " usage=", static_cast<unsigned>(info.usage),
++      " options=", static_cast<uint64_t>(info.options),
++      " offset=", offset, " row-bytes=", bytes_per_row));
++}
++
++void
++flightRecorderTextureView(obj_handle_t parent, obj_handle_t texture,
++                          WMTPixelFormat format, WMTTextureType type,
++                          uint16_t level_start, uint16_t level_count,
++                          uint16_t slice_start, uint16_t slice_count) {
++  Logger::debug(str::format(
++      "flight texture-view parent=", static_cast<uint64_t>(parent),
++      " texture=", static_cast<uint64_t>(texture),
++      " format=", static_cast<uint64_t>(format),
++      " type=", static_cast<unsigned>(type),
++      " levels=", level_start, "+", level_count,
++      " slices=", slice_start, "+", slice_count));
++}
++
+ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Device device, InternalCommandLibrary &lib) :
+     emulated_cmd(device, lib, *this),
+     clear_rt_cmd(device, lib, *this),
+@@ -859,8 +974,188 @@ ArgumentEncodingContext::$$setEncodingContext(uint64_t seq_id, uint64_t frame_id
  
  constexpr unsigned kEncoderOptimizerThreshold = 64;
  
@@ -469,7 +588,7 @@ index 5445501..31a9822 100644
    assert(!encoder_current);
  
    unsigned encoder_count = encoder_count_;
-@@ -893,6 +1074,9 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
+@@ -893,6 +1188,9 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
      }
    }
  
@@ -479,7 +598,7 @@ index 5445501..31a9822 100644
    QueryReadbacks readbacks{};
  
    if (auto count = vro_state_.reset()) {
-@@ -1590,4 +1774,4 @@ ArgumentEncodingContext::isResolveSignatureMatched(RenderEncoderData *render, Re
+@@ -1590,4 +1888,4 @@ ArgumentEncodingContext::isResolveSignatureMatched(RenderEncoderData *render, Re
    return ret;
  }
  
@@ -602,10 +721,10 @@ index 86c9d72..a1e5abd 100644
 \ No newline at end of file
 +} // namespace dxmt
 diff --git a/src/util/log/log.cpp b/src/util/log/log.cpp
-index 96ced95..6a56901 100644
+index 96ced95..0a792de 100644
 --- a/src/util/log/log.cpp
 +++ b/src/util/log/log.cpp
-@@ -9,15 +9,135 @@
+@@ -9,7 +9,12 @@
   */
  
  #include <iostream>
@@ -618,130 +737,7 @@ index 96ced95..6a56901 100644
  
  #include "log.hpp"
  
-+#include "Metal.hpp"
- #include "../util_env.hpp"
- #include "util_string.hpp"
- 
- namespace dxmt {
- 
-+static uint64_t
-+flightPipelineColorHash(const WMTColorAttachmentBlendInfo *colors) {
-+  uint64_t hash = 1469598103934665603ull;
-+  for (unsigned i = 0; i < 8; i++) {
-+    hash ^= static_cast<uint64_t>(colors[i].pixel_format);
-+    hash *= 1099511628211ull;
-+    hash ^= static_cast<uint64_t>(colors[i].write_mask) |
-+            (static_cast<uint64_t>(colors[i].blending_enabled) << 8) |
-+            (static_cast<uint64_t>(colors[i].rgb_blend_operation) << 16) |
-+            (static_cast<uint64_t>(colors[i].alpha_blend_operation) << 24);
-+    hash *= 1099511628211ull;
-+  }
-+  return hash;
-+}
-+
-+void
-+flightRecorderPipeline(obj_handle_t device,
-+                       const WMTComputePipelineInfo &info,
-+                       obj_handle_t pipeline) {
-+  Logger::debug(str::format(
-+      "flight pipeline-create kind=compute device=", static_cast<uint64_t>(device),
-+      " pso=", static_cast<uint64_t>(pipeline),
-+      " function=", static_cast<uint64_t>(info.compute_function),
-+      " tg-multiple=", info.tgsize_is_multiple_of_sgwidth,
-+      " immutable=", info.immutable_buffers));
-+}
-+
-+void
-+flightRecorderPipeline(obj_handle_t device,
-+                       const WMTRenderPipelineInfo &info,
-+                       obj_handle_t pipeline) {
-+  Logger::debug(str::format(
-+      "flight pipeline-create kind=render device=", static_cast<uint64_t>(device),
-+      " pso=", static_cast<uint64_t>(pipeline),
-+      " vertex=", static_cast<uint64_t>(info.vertex_function),
-+      " fragment=", static_cast<uint64_t>(info.fragment_function),
-+      " formats=", flightPipelineColorHash(info.colors),
-+      " depth=", static_cast<uint64_t>(info.depth_pixel_format),
-+      " stencil=", static_cast<uint64_t>(info.stencil_pixel_format),
-+      " samples=", static_cast<unsigned>(info.raster_sample_count),
-+      " topology=", static_cast<unsigned>(info.input_primitive_topology),
-+      " raster=", info.rasterization_enabled,
-+      " alpha-to-coverage=", info.alpha_to_coverage_enabled));
-+}
-+
-+void
-+flightRecorderPipeline(obj_handle_t device,
-+                       const WMTMeshRenderPipelineInfo &info,
-+                       obj_handle_t pipeline) {
-+  Logger::debug(str::format(
-+      "flight pipeline-create kind=mesh device=", static_cast<uint64_t>(device),
-+      " pso=", static_cast<uint64_t>(pipeline),
-+      " object=", static_cast<uint64_t>(info.object_function),
-+      " mesh=", static_cast<uint64_t>(info.mesh_function),
-+      " fragment=", static_cast<uint64_t>(info.fragment_function),
-+      " formats=", flightPipelineColorHash(info.colors),
-+      " depth=", static_cast<uint64_t>(info.depth_pixel_format),
-+      " stencil=", static_cast<uint64_t>(info.stencil_pixel_format),
-+      " samples=", static_cast<unsigned>(info.raster_sample_count),
-+      " payload=", info.payload_memory_length));
-+}
-+
-+void
-+flightRecorderPipeline(obj_handle_t device,
-+                       const WMTTileRenderPipelineInfo &info,
-+                       obj_handle_t pipeline) {
-+  uint64_t formats = 1469598103934665603ull;
-+  for (auto format : info.color_formats) {
-+    formats ^= static_cast<uint64_t>(format);
-+    formats *= 1099511628211ull;
-+  }
-+  Logger::debug(str::format(
-+      "flight pipeline-create kind=tile device=", static_cast<uint64_t>(device),
-+      " pso=", static_cast<uint64_t>(pipeline),
-+      " function=", static_cast<uint64_t>(info.tile_function),
-+      " formats=", formats,
-+      " samples=", static_cast<unsigned>(info.raster_sample_count),
-+      " tg-tile=", info.tgsize_matches_tile_size));
-+}
-+
-+void
-+flightRecorderTexture(const char *kind, obj_handle_t parent,
-+                      const WMTTextureInfo &info, obj_handle_t texture,
-+                      uint64_t offset, uint64_t bytes_per_row) {
-+  Logger::debug(str::format(
-+      "flight texture-create kind=", kind,
-+      " parent=", static_cast<uint64_t>(parent),
-+      " texture=", static_cast<uint64_t>(texture),
-+      " gpu-resource=", info.gpu_resource_id,
-+      " format=", static_cast<uint64_t>(info.pixel_format),
-+      " size=", info.width, "x", info.height, "x", info.depth,
-+      " array=", info.array_length,
-+      " mips=", static_cast<unsigned>(info.mipmap_level_count),
-+      " samples=", static_cast<unsigned>(info.sample_count),
-+      " type=", static_cast<unsigned>(info.type),
-+      " usage=", static_cast<unsigned>(info.usage),
-+      " options=", static_cast<uint64_t>(info.options),
-+      " offset=", offset, " row-bytes=", bytes_per_row));
-+}
-+
-+void
-+flightRecorderTextureView(obj_handle_t parent, obj_handle_t texture,
-+                          WMTPixelFormat format, WMTTextureType type,
-+                          uint16_t level_start, uint16_t level_count,
-+                          uint16_t slice_start, uint16_t slice_count) {
-+  Logger::debug(str::format(
-+      "flight texture-view parent=", static_cast<uint64_t>(parent),
-+      " texture=", static_cast<uint64_t>(texture),
-+      " format=", static_cast<uint64_t>(format),
-+      " type=", static_cast<unsigned>(type),
-+      " levels=", level_start, "+", level_count,
-+      " slices=", slice_start, "+", slice_count));
-+}
-+
- Logger::Logger(const std::string &fileName)
-     : m_minLevel(getMinLogLevel()), m_fileName(fileName) {}
- 
-@@ -67,7 +187,8 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
+@@ -67,7 +72,8 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
        auto path = getFileName(m_fileName);
  
        if (!path.empty())
@@ -751,7 +747,7 @@ index 96ced95..6a56901 100644
      }
  
      std::stringstream stream(message);
-@@ -75,7 +196,17 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
+@@ -75,7 +81,17 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
  
      while (std::getline(stream, line, '\n')) {
        std::stringstream outstream;
@@ -770,7 +766,7 @@ index 96ced95..6a56901 100644
  
        std::string adjusted = outstream.str();
  
-@@ -86,8 +217,10 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
+@@ -86,8 +102,10 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
            std::cerr << adjusted;
        }
  
