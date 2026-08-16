@@ -1,8 +1,9 @@
 # Windows Quick Settings GPU flight recorder
 
 This diagnostic build records the state immediately before DXMT submits Metal
-work. It does not change queue depth, asynchronous encoding, fences, command
-ordering, presentation, resource lifetime, or error handling.
+work and enables Metal encoder execution status for each command buffer. It
+does not change queue depth, asynchronous encoding, fences, command ordering,
+presentation, or resource lifetime.
 
 ## Recorded layers
 
@@ -14,16 +15,21 @@ The DXMT main log (`tmp/*_dxmt.log`) records:
   topology;
 - texture and texture-view creation, including handle, format, dimensions,
   mip levels, sample count, usage, and storage options;
+- buffer creation and destruction, including GPU base address, allocation
+  length, storage options, and suballocation information;
+- shader argument values after DXMT writes the Metal argument table, including
+  buffer GPU addresses, resource IDs, byte lengths, and UAV counter values;
 - Metal command-buffer errors.
 
-Each DXMT queue has two independent append-only files. The submit file has one
-writer (that queue's encode thread), and the completion file has one writer
-(that queue's finish thread), so diagnostic logging does not introduce a lock
-between queues:
+Each DXMT queue has three independent append-only files. The submit and detail
+files have one writer (that queue's encode thread), and the completion file has
+one writer (that queue's finish thread), so diagnostic logging does not
+introduce a lock between queues:
 
 ```text
 tmp/*_dxmt_queue_*.submit.flight.log
 tmp/*_dxmt_queue_*.complete.flight.log
+tmp/*_dxmt_queue_*.detail.flight.log
 ```
 
 Every submit line includes a global submission id, DXMT queue id, sequence,
@@ -33,7 +39,10 @@ render-target dimensions and flags, and command/pipeline/resource/format
 fingerprints. It also includes the final command, pipeline, and resource handle
 so they can be joined directly to the creation records in the main DXMT log.
 Completion is checkpointed every 16 command buffers and is always recorded on
-an error.
+an error. The detail stream contains one record for every encoder and command,
+including encoder labels, debug-signpost ordinals, draw/dispatch/copy
+parameters, attachment formats, buffer offsets, and resource handles. It is
+intentionally high overhead and is only used by the isolated v2 package.
 
 The Neptune log (`tmp/_npt_lifecycle.log`, with one rotated
 `tmp/_npt_lifecycle.log.previous`) records:
@@ -54,12 +63,13 @@ to be aligned without relying only on wall-clock time.
 Do not launch the diagnostic UTM package again before collecting logs; its
 files are append-only, but preserving the exact end of the failed session makes
 analysis simpler. Find the data container for bundle id
-`com.utmapp.UTMdxflight`, then copy all files matching:
+`com.utmapp.UTMdxtrace2`, then copy all files matching:
 
 ```text
 tmp/_npt_lifecycle.log*
 tmp/*_dxmt.log
 tmp/*_dxmt_queue_*.flight.log
+tmp/*_dxmt_queue_*.detail.flight.log
 Documents/*.log
 Library/Logs/**
 ```
@@ -95,3 +105,4 @@ The recorder cannot guarantee attribution if iPadOS loses the final dirty file
 pages during a kernel panic. It flushes every DXMT submit and every emitted
 Neptune snapshot, while avoiding `fsync` because forcing storage on every frame
 would materially change timing and power behavior.
+

@@ -286,7 +286,8 @@ jobs:
           test -d UTM.xcarchive/Products/Applications/UTM.app
 
           /usr/libexec/PlistBuddy \
-            -c "Set :CFBundleIdentifier com.utmapp.UTMdxflight" \
+            -c "Set :CFBundleIdentifier com.utmapp.UTMdxtrace2" \
+            -c "Add :CFBundleDisplayName string UTM DX Trace v2" \
             UTM.xcarchive/Products/Applications/UTM.app/Info.plist
 
           echo "Archive created:"
@@ -355,7 +356,7 @@ jobs:
             "$APP_PATH/Info.plist"
 
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
-            "$APP_PATH/Info.plist")" = "com.utmapp.UTMdxflight"
+            "$APP_PATH/Info.plist")" = "com.utmapp.UTMdxtrace2"
 
           /usr/libexec/PlistBuddy \
             -c "Print :MinimumOSVersion" \
@@ -388,8 +389,9 @@ jobs:
         if: inputs.build_target == 'full'
         uses: actions/upload-artifact@v4
         with:
-          name: UTM-HV-Windows-Quick-Settings-Flight-Recorder-iPadOS-16.3-arm64
+          name: UTM-HV-Windows-Quick-Settings-Max-Trace-v2-iPadOS-16.3-arm64
           path: UTM-HV.ipa
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
