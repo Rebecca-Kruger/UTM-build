@@ -59,7 +59,7 @@ diff --git a/src/dxmt/dxmt_command_queue.cpp b/src/dxmt/dxmt_command_queue.cpp
 index 89ffc37..234c61b 100644
 --- a/src/dxmt/dxmt_command_queue.cpp
 +++ b/src/dxmt/dxmt_command_queue.cpp
-@@ -20,20 +20,33 @@
+@@ -20,20 +20,35 @@
  #include "dxmt_command_queue.hpp"
  #include "Metal.hpp"
  #include "dxmt_statistics.hpp"
@@ -68,6 +68,7 @@ index 89ffc37..234c61b 100644
  #include "util_win32_compat.h"
  #include <atomic>
 +#include <chrono>
++#include <mutex>
 +#include <sstream>
 +#include <thread>
 +#ifndef _WIN32
@@ -82,6 +83,7 @@ index 89ffc37..234c61b 100644
 +static std::atomic_uint32_t diagnostic_live_queues{0};
 +static std::atomic_uint64_t diagnostic_next_submission_id{1};
 +static std::atomic_uint32_t diagnostic_global_inflight{0};
++static std::once_flag diagnostic_clock_anchor_once;
 +
  void *
  CommandChunk::allocate_cpu_heap(size_t size, size_t alignment) {
@@ -93,7 +95,7 @@ index 89ffc37..234c61b 100644
      encodeThread([this]() { this->EncodingThread(); }),
      finishThread([this]() { this->WaitForFinishThread(); }),
      device(device),
-@@ -70,9 +83,34 @@ CommandQueue::CommandQueue(WMT::Device device) :
+@@ -70,9 +83,42 @@ CommandQueue::CommandQueue(WMT::Device device) :
      } catch (const std::invalid_argument &) {
      }
    }
@@ -115,6 +117,14 @@ index 89ffc37..234c61b 100644
 +        str::topath((diagnostic_base + ".detail.flight.log").c_str()).c_str(),
 +        std::ios::out | std::ios::app);
 +  }
++  std::call_once(diagnostic_clock_anchor_once, [] {
++    const auto steady = std::chrono::duration_cast<std::chrono::microseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++    const auto system = std::chrono::duration_cast<std::chrono::microseconds>(
++        std::chrono::system_clock::now().time_since_epoch()).count();
++    Logger::info(str::format("flight recorder-start schema=3 steady-us=", steady,
++                             " system-us=", system));
++  });
 +  Logger::info(str::format("lifecycle queue-create id=", diagnostic_id_,
 +                           " ptr=", reinterpret_cast<uintptr_t>(this),
 +                           " metal-device=", static_cast<uint64_t>(device.handle),
@@ -197,7 +207,7 @@ index 89ffc37..234c61b 100644
  void
  CommandQueue::CommitCurrentChunk() {
    auto chunk_id = ready_for_encode.load(std::memory_order_relaxed);
-@@ -152,12 +249,41 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk, uint64_t seq) {
+@@ -152,12 +249,45 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk, uint64_t seq) {
    }
    }
  
@@ -239,6 +249,10 @@ index 89ffc37..234c61b 100644
 +      " fmthash=", flight.attachment_format_hash));
 +  DiagnosticLogDetail(chunk.flight_submission_id, flight.detail);
    cmdbuf.commit();
++  DiagnosticLogSubmit(str::format(
++      "flight committed id=", chunk.flight_submission_id,
++      " queue=", diagnostic_id_, " seq=", seq,
++      " cmdbuf=", static_cast<uint64_t>(cmdbuf.handle)));
  
    ready_for_commit.fetch_add(1, std::memory_order_release);
 @@ -198,7 +324,12 @@ CommandQueue::WaitForFinishThread() {
@@ -255,22 +269,28 @@ index 89ffc37..234c61b 100644
      }
      if (auto logs = chunk.attached_cmdbuf.logs()) {
        for (auto &log : logs.elements()) {
-@@ -209,6 +340,19 @@ CommandQueue::WaitForFinishThread() {
+@@ -209,6 +340,25 @@ CommandQueue::WaitForFinishThread() {
      if (chunk.signal_frame_latency_fence_ != ~0ull)
        frame_latency_fence_.signal(chunk.signal_frame_latency_fence_);
  
 +    const auto completed_id = chunk.flight_submission_id;
 +    const auto completion_status = chunk.attached_cmdbuf.status();
++    const auto kernel_start_ns = chunk.attached_cmdbuf.kernelStartTime();
++    const auto kernel_end_ns = chunk.attached_cmdbuf.kernelEndTime();
++    const auto gpu_start_ns = chunk.attached_cmdbuf.gpuStartTime();
++    const auto gpu_end_ns = chunk.attached_cmdbuf.gpuEndTime();
 +    diagnostic_last_completed_.store(completed_id, std::memory_order_relaxed);
 +    const auto queue_inflight = diagnostic_inflight_.fetch_sub(1) - 1;
 +    const auto global_inflight = diagnostic_global_inflight.fetch_sub(1) - 1;
-+    if ((internal_seq & 15u) == 0) {
-+      DiagnosticLogCompletion(str::format(
-+          "flight complete-checkpoint id=", completed_id,
-+          " queue=", diagnostic_id_, " seq=", internal_seq,
-+          " status=", completion_status, " qinflight=", queue_inflight,
-+          " ginflight=", global_inflight));
-+    }
++    DiagnosticLogCompletion(str::format(
++        "flight complete id=", completed_id,
++        " queue=", diagnostic_id_, " seq=", internal_seq,
++        " status=", completion_status, " qinflight=", queue_inflight,
++        " ginflight=", global_inflight,
++        " kernel-start-ns=", kernel_start_ns,
++        " kernel-end-ns=", kernel_end_ns,
++        " gpu-start-ns=", gpu_start_ns,
++        " gpu-end-ns=", gpu_end_ns));
 +
      chunk.reset();
      cpu_coherent.signal(internal_seq);
@@ -355,7 +375,7 @@ diff --git a/src/dxmt/dxmt_context.cpp b/src/dxmt/dxmt_context.cpp
 index 5445501..981c513 100644
 --- a/src/dxmt/dxmt_context.cpp
 +++ b/src/dxmt/dxmt_context.cpp
-@@ -24,11 +24,139 @@
+@@ -24,11 +24,141 @@
  #include "dxmt_occlusion_query.hpp"
  #include "dxmt_presenter.hpp"
  #include "wsi_platform.hpp"
@@ -467,12 +487,14 @@ index 5445501..981c513 100644
 +
 +void
 +flightRecorderTextureView(obj_handle_t parent, obj_handle_t texture,
++                          uint64_t gpu_resource_id,
 +                          WMTPixelFormat format, WMTTextureType type,
 +                          uint16_t level_start, uint16_t level_count,
 +                          uint16_t slice_start, uint16_t slice_count) {
 +  Logger::debug(str::format(
 +      "flight texture-view parent=", static_cast<uint64_t>(parent),
 +      " texture=", static_cast<uint64_t>(texture),
++      " gpu-resource=", gpu_resource_id,
 +      " format=", static_cast<uint64_t>(format),
 +      " type=", static_cast<unsigned>(type),
 +      " levels=", level_start, "+", level_count,
@@ -495,11 +517,11 @@ index 5445501..981c513 100644
  ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Device device, InternalCommandLibrary &lib) :
      emulated_cmd(device, lib, *this),
      clear_rt_cmd(device, lib, *this),
-@@ -418,6 +546,17 @@ ArgumentEncodingContext::encodeShaderResources(
+@@ -418,6 +546,22 @@ ArgumentEncodingContext::encodeShaderResources(
        break;
      }
      }
-+    Logger::debug(str::format(
++    auto shader_log = str::format(
 +        "flight shader-arg stage=", static_cast<unsigned>(stage),
 +        " kind=", static_cast<unsigned>(kind), " index=", i,
 +        " binding=", static_cast<unsigned>(arg.SM50BindingSlot),
@@ -508,12 +530,17 @@ index 5445501..981c513 100644
 +        " table-offset=", offset,
 +        " structure-offset=", arg.StructurePtrOffset,
 +        " value0=", encoded_buffer[arg.StructurePtrOffset],
-+        " value1=", encoded_buffer[arg.StructurePtrOffset + 1],
-+        " value2=", encoded_buffer[arg.StructurePtrOffset + 2]));
++        " value1=", encoded_buffer[arg.StructurePtrOffset + 1]);
++    if (arg.Type == SM50BindingType::Sampler ||
++        (arg.Type == SM50BindingType::UAV &&
++         (arg.Flags & MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER)))
++      shader_log += str::format(
++          " value2=", encoded_buffer[arg.StructurePtrOffset + 2]);
++    Logger::debug(shader_log);
    }
  
    if constexpr (stage == PipelineStage::Compute) {
-@@ -859,8 +998,412 @@ ArgumentEncodingContext::$$setEncodingContext(uint64_t seq_id, uint64_t frame_id
+@@ -859,8 +998,482 @@ ArgumentEncodingContext::$$setEncodingContext(uint64_t seq_id, uint64_t frame_id
  
  constexpr unsigned kEncoderOptimizerThreshold = 64;
  
@@ -721,6 +748,76 @@ index 5445501..981c513 100644
 +                            " dst=", static_cast<uint64_t>(cmd->dst),
 +                            " dst-offset=", cmd->dst_offset,
 +                            " length=", cmd->copy_length);
++      break;
++    }
++    case WMTBlitCommandCopyFromBufferToTexture:
++    case WMTBlitCommandCopyFromBufferToTextureWithBlitOption: {
++      auto cmd = reinterpret_cast<wmtcmd_blit_copy_from_buffer_to_texture *>(command);
++      detail += str::format(" src=", static_cast<uint64_t>(cmd->src),
++                            " src-offset=", cmd->src_offset,
++                            " bytes-per-row=", cmd->bytes_per_row,
++                            " bytes-per-image=", cmd->bytes_per_image,
++                            " size=", cmd->size.width, "x", cmd->size.height,
++                            "x", cmd->size.depth,
++                            " dst=", static_cast<uint64_t>(cmd->dst),
++                            " dst-slice=", cmd->slice,
++                            " dst-level=", cmd->level,
++                            " dst-origin=", cmd->origin.x, ",", cmd->origin.y,
++                            ",", cmd->origin.z);
++      if (type == WMTBlitCommandCopyFromBufferToTextureWithBlitOption) {
++        auto option_cmd = reinterpret_cast<wmtcmd_blit_copy_from_buffer_to_texture_withblitoption *>(command);
++        detail += str::format(" options=", option_cmd->options);
++      }
++      break;
++    }
++    case WMTBlitCommandCopyFromTextureToBuffer: {
++      auto cmd = reinterpret_cast<wmtcmd_blit_copy_from_texture_to_buffer *>(command);
++      detail += str::format(" src=", static_cast<uint64_t>(cmd->src),
++                            " src-slice=", cmd->slice,
++                            " src-level=", cmd->level,
++                            " src-origin=", cmd->origin.x, ",", cmd->origin.y,
++                            ",", cmd->origin.z,
++                            " size=", cmd->size.width, "x", cmd->size.height,
++                            "x", cmd->size.depth,
++                            " dst=", static_cast<uint64_t>(cmd->dst),
++                            " dst-offset=", cmd->offset,
++                            " bytes-per-row=", cmd->bytes_per_row,
++                            " bytes-per-image=", cmd->bytes_per_image);
++      break;
++    }
++    case WMTBlitCommandCopyFromTextureToTexture: {
++      auto cmd = reinterpret_cast<wmtcmd_blit_copy_from_texture_to_texture *>(command);
++      detail += str::format(" src=", static_cast<uint64_t>(cmd->src),
++                            " src-slice=", cmd->src_slice,
++                            " src-level=", cmd->src_level,
++                            " src-origin=", cmd->src_origin.x, ",", cmd->src_origin.y,
++                            ",", cmd->src_origin.z,
++                            " src-size=", cmd->src_size.width, "x", cmd->src_size.height,
++                            "x", cmd->src_size.depth,
++                            " dst=", static_cast<uint64_t>(cmd->dst),
++                            " dst-slice=", cmd->dst_slice,
++                            " dst-level=", cmd->dst_level,
++                            " dst-origin=", cmd->dst_origin.x, ",", cmd->dst_origin.y,
++                            ",", cmd->dst_origin.z);
++      break;
++    }
++    case WMTBlitCommandGenerateMipmaps: {
++      auto cmd = reinterpret_cast<wmtcmd_blit_generate_mipmaps *>(command);
++      detail += str::format(" texture=", static_cast<uint64_t>(cmd->texture));
++      break;
++    }
++    case WMTBlitCommandWaitForFence:
++    case WMTBlitCommandUpdateFence: {
++      auto cmd = reinterpret_cast<wmtcmd_blit_fence_op *>(command);
++      detail += str::format(" fence=", static_cast<uint64_t>(cmd->fence));
++      break;
++    }
++    case WMTBlitCommandResolveCounters: {
++      auto cmd = reinterpret_cast<wmtcmd_blit_resolvecounters *>(command);
++      detail += str::format(" sample-buffer=", static_cast<uint64_t>(cmd->sample_buffer),
++                            " start=", cmd->start, " length=", cmd->len,
++                            " dst-buffer=", static_cast<uint64_t>(cmd->dst_buffer),
++                            " dst-offset=", cmd->dst_offset);
 +      break;
 +    }
 +    case WMTBlitCommandFillBuffer: {
@@ -1223,6 +1320,18 @@ index 7153d1c..1d09605 100644
  #include "dxmt_residency.hpp"
  #include "wsi_platform.hpp"
  #include <atomic>
+@@ -34,5 +34,9 @@
+ void
+ TextureView::decRef() {
+-  if (refcount_.fetch_sub(1u, std::memory_order_release) == 1u)
+-    delete this;
++  if (refcount_.fetch_sub(1u, std::memory_order_release) == 1u) {
++    Logger::debug(str::format(
++        "flight texture-view-destroy texture=", static_cast<uint64_t>(texture.handle),
++        " gpu-resource=", gpuResourceID));
++    delete this;
++  }
+ };
 @@ -90,6 +91,10 @@ TextureAllocation::TextureAllocation(
  
  void
@@ -1303,7 +1412,7 @@ diff --git a/src/winemetal/Metal.hpp b/src/winemetal/Metal.hpp
 index 36630dd..ad67dea 100644
 --- a/src/winemetal/Metal.hpp
 +++ b/src/winemetal/Metal.hpp
-@@ -6,6 +6,30 @@
+@@ -6,6 +6,31 @@
  #include <cstring>
  #include <vector>
  
@@ -1324,6 +1433,7 @@ index 36630dd..ad67dea 100644
 +                           const WMTTextureInfo &info, obj_handle_t texture,
 +                           uint64_t offset, uint64_t bytes_per_row);
 +void flightRecorderTextureView(obj_handle_t parent, obj_handle_t texture,
++                               uint64_t gpu_resource_id,
 +                               WMTPixelFormat format, WMTTextureType type,
 +                               uint16_t level_start, uint16_t level_count,
 +                               uint16_t slice_start, uint16_t slice_count);
@@ -1342,7 +1452,7 @@ index 36630dd..ad67dea 100644
 +    auto texture = Reference<Texture>(MTLTexture_newTextureView(
          handle, format, texture_type, level_start, level_count, slice_start, slice_count, swizzle, &out_gpu_resource_id
      ));
-+    dxmt::flightRecorderTextureView(handle, texture.handle, format,
++    dxmt::flightRecorderTextureView(handle, texture.handle, out_gpu_resource_id, format,
 +                                    texture_type, level_start, level_count,
 +                                    slice_start, slice_count);
 +    return texture;
@@ -1374,6 +1484,32 @@ index 36630dd..ad67dea 100644
  };
  
  class ComputePipelineState : public Object {
+@@ -651,9 +651,24 @@ public:
+   LogContainer
+   logs() {
+     return LogContainer{MTLCommandBuffer_logs(handle)};
+   }
+-
++
++  uint64_t
++  kernelStartTime() {
++    return MTLCommandBuffer_property(handle, WMTCommandBufferPropertyKernelStartTime);
++  }
++
++  uint64_t
++  kernelEndTime() {
++    return MTLCommandBuffer_property(handle, WMTCommandBufferPropertyKernelEndTime);
++  }
++
++  uint64_t
++  gpuStartTime() {
++    return MTLCommandBuffer_property(handle, WMTCommandBufferPropertyGPUStartTime);
++  }
++
+   uint64_t
+   gpuEndTime() {
+     return MTLCommandBuffer_property(handle, WMTCommandBufferPropertyGPUEndTime);
+   }
 @@ -719,6 +756,11 @@ public:
      return CommandBuffer{MTLCommandQueue_commandBuffer(handle)};
    }
@@ -1610,5 +1746,3 @@ index aa696b5..87a9693 100644
  WINEMETAL_API void
  MTLDevice_setShouldMaximizeConcurrentCompilation(obj_handle_t device, bool value) {
    struct unixcall_generic_obj_uint64_noret params;
-
-

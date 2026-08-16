@@ -287,7 +287,7 @@ jobs:
 
           /usr/libexec/PlistBuddy \
             -c "Set :CFBundleIdentifier com.utmapp.UTMdxtrace2" \
-            -c "Add :CFBundleDisplayName string UTM DX Trace v2" \
+            -c "Add :CFBundleDisplayName string UTM DX Trace v3" \
             UTM.xcarchive/Products/Applications/UTM.app/Info.plist
 
           echo "Archive created:"
@@ -358,6 +358,9 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
             "$APP_PATH/Info.plist")" = "com.utmapp.UTMdxtrace2"
 
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' \
+            "$APP_PATH/Info.plist")" = "UTM DX Trace v3"
+
           /usr/libexec/PlistBuddy \
             -c "Print :MinimumOSVersion" \
             "$APP_PATH/Info.plist"
@@ -389,7 +392,7 @@ jobs:
         if: inputs.build_target == 'full'
         uses: actions/upload-artifact@v4
         with:
-          name: UTM-HV-Windows-Quick-Settings-Max-Trace-v2-iPadOS-16.3-arm64
+          name: UTM-HV-Windows-Quick-Settings-Max-Trace-v3-iPadOS-16.3-arm64
           path: UTM-HV.ipa
           if-no-files-found: error
           compression-level: 0

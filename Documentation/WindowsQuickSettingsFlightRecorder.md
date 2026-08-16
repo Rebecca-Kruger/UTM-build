@@ -1,9 +1,11 @@
-# Windows Quick Settings GPU flight recorder
+# Windows Quick Settings GPU flight recorder (v3)
 
 This diagnostic build records the state immediately before DXMT submits Metal
-work and enables Metal encoder execution status for each command buffer. It
-does not change queue depth, asynchronous encoding, fences, command ordering,
-presentation, or resource lifetime.
+work and enables Metal encoder execution status for each command buffer. v3
+records every command-buffer completion, including the Metal kernel/GPU start
+and end timestamps, and adds full blit-copy provenance. It does not change
+queue depth, asynchronous encoding, fences, command ordering, presentation,
+or resource lifetime.
 
 ## Recorded layers
 
@@ -19,6 +21,7 @@ The DXMT main log (`tmp/*_dxmt.log`) records:
   length, storage options, and suballocation information;
 - shader argument values after DXMT writes the Metal argument table, including
   buffer GPU addresses, resource IDs, byte lengths, and UAV counter values;
+  the optional third value is recorded only for samplers and counter UAVs;
 - Metal command-buffer errors.
 
 Each DXMT queue has three independent append-only files. The submit and detail
@@ -38,11 +41,17 @@ encoder mask, render/compute/blit/present counts, draw/dispatch/copy counts,
 render-target dimensions and flags, and command/pipeline/resource/format
 fingerprints. It also includes the final command, pipeline, and resource handle
 so they can be joined directly to the creation records in the main DXMT log.
-Completion is checkpointed every 16 command buffers and is always recorded on
-an error. The detail stream contains one record for every encoder and command,
-including encoder labels, debug-signpost ordinals, draw/dispatch/copy
-parameters, attachment formats, buffer offsets, and resource handles. It is
-intentionally high overhead and is only used by the isolated v2 package.
+v3 records one completion line for every command buffer, not only periodic
+checkpoints. Completion lines include the queue/global in-flight counts and
+the kernel/GPU timing fields (zero when the platform does not provide them).
+The detail stream contains one record for every encoder and command, including
+encoder labels, debug-signpost ordinals, draw/dispatch/copy parameters,
+attachment formats, buffer offsets, and resource handles. Blit records cover
+buffer-to-buffer, buffer-to-texture, texture-to-buffer, texture-to-texture,
+mipmap, fence, counter-resolve, and fill operations. Texture-view records now
+include the DXMT GPU-resource id, and view destruction is logged so stale-view
+and resource-reuse hypotheses can be tested. It is intentionally high overhead
+and is only used by the isolated v3 package.
 
 The Neptune log (`tmp/_npt_lifecycle.log`, with one rotated
 `tmp/_npt_lifecycle.log.previous`) records:
@@ -54,16 +63,19 @@ The Neptune log (`tmp/_npt_lifecycle.log`, with one rotated
   timeout count, and final fence id;
 - fatal decoder snapshots immediately when detected.
 
-Every line uses a monotonic timestamp plus process and thread id. This allows
-the Neptune stream, DXMT stream, UTM debug log, and the final iPadOS panic time
-to be aligned without relying only on wall-clock time.
+Every line uses a process-local monotonic timestamp plus process and thread id.
+The first `flight recorder-start schema=3` line records both the monotonic and
+wall-clock anchors. Use that pair to align DXMT events with the UTM/system
+logs; do not subtract a monotonic value directly from an iPadOS panic's
+absolute-time field.
 
 ## Collection after a reboot
 
 Do not launch the diagnostic UTM package again before collecting logs; its
 files are append-only, but preserving the exact end of the failed session makes
 analysis simpler. Find the data container for bundle id
-`com.utmapp.UTMdxtrace2`, then copy all files matching:
+`com.utmapp.UTMdxtrace2` (the v2 container is intentionally overwritten so
+existing collection scripts keep working), then copy all files matching:
 
 ```text
 tmp/_npt_lifecycle.log*
